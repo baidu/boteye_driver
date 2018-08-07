@@ -20,7 +20,12 @@
 #include <fstream>
 #include <list>
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <utilbase.h>
+#endif  // __ANDROID__
 #ifdef __linux__  // Only support Linux for now
+
 namespace XPDRIVER {
 // V4L2 related utility functions implementation
 /* config the buffer */
@@ -93,6 +98,8 @@ bool init_mmap(int fd) {
 bool init_v4l2(const std::string& dev_name_in,
                int* fd_ptr,
                struct v4l2_buffer* bufferinfo_ptr) {
+  int& fd = *fd_ptr;
+  bool find_cam = false;
   const bool dev_name_given = !dev_name_in.empty();
   std::list<std::string> possible_dev_names;
   if (dev_name_given) {
@@ -103,8 +110,6 @@ bool init_v4l2(const std::string& dev_name_in,
     possible_dev_names.push_back("/dev/video2");
     possible_dev_names.push_back("/dev/video3");
   }
-  int& fd = *fd_ptr;
-  bool find_cam = false;
   for (const auto& dev_name : possible_dev_names) {
     // Check the existence of dev_name
     {

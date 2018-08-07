@@ -42,8 +42,8 @@ project(xpdriver)
 
 # Define the minimum supported firmware version number and generate the firmware_config.h
 set(MIN_FIRMWARE_VERSION_MAJOR 0)
-set(MIN_FIRMWARE_VERSION_MINOR 7)
-set(MIN_FIRMWARE_VERSION_PATCH 3)
+set(MIN_FIRMWARE_VERSION_MINOR 8)
+set(MIN_FIRMWARE_VERSION_PATCH 5)
 configure_file(
  cmake/firmware_config.h.in
  ${PROJECT_SOURCE_DIR}/include/driver/firmware_config.h
@@ -76,8 +76,18 @@ set(CMAKE_C_FLAGS "-std=gnu99 -Wno-deprecated-declarations ${CMAKE_C_FLAGS} ${NE
 
 #TODO(le) Enable to debug with glog (require GLOG)
 #add_definitions(-D__DRIVER_GLOG_DEBUG__)
-find_package(OpenCV 3.0.0 REQUIRED)
-include_directories(${PROJECT_SOURCE_DIR}/include/)
+find_package(OpenCV 3.0.0 QUIET)
+if(NOT OpenCV_FOUND)
+  find_package(OpenCV 2.4.3 QUIET)
+  if(NOT OpenCV_FOUND)
+    message(FATAL_ERROR "OpenCV > 2.4.3 not found.")
+  endif()
+endif()
+
+include_directories(
+  ${PROJECT_SOURCE_DIR}/include/
+  ${OpenCV_INCLUDE_DIRS}
+)
 set(SOURCES
  src/XP_sensor.cc
  src/XP_sensor_driver.cc
@@ -91,6 +101,7 @@ set(DRIVER_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/include"
  CACHE string "driver includes")
 
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
+target_include_directories(${PROJECT_NAME} PUBLIC ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(${PROJECT_NAME} ${OpenCV_LIBS})
 
 # For binary release

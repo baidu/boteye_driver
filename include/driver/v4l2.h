@@ -32,7 +32,7 @@
 namespace XPDRIVER {
 
 // V4L2 related functions
-static const int V4L2_BUFFER_NUM = 6;
+static const int V4L2_BUFFER_NUM = 4;
 bool init_mmap(int fd);
 bool init_v4l2(const std::string& dev_name,
                int* fd_ptr,

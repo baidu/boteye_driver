@@ -19,6 +19,7 @@
 #include <driver/helper/xp_logging.h>
 #include <opencv2/core.hpp>
 #include <vector>
+#include <string>
 
 namespace XPDRIVER {
 class AutoWhiteBalance {
@@ -35,6 +36,20 @@ class AutoWhiteBalance {
   inline ~AutoWhiteBalance() {
   }
   inline void run(cv::Mat* rgb_img_ptr) {
+    XP_CHECK_EQ(rgb_img_ptr != NULL, true);
+    XP_CHECK_EQ(rgb_img_ptr->channels(), 3);
+    XP_CHECK_EQ(rgb_img_ptr->type(), CV_8UC3);
+    if (!m_use_preset_) {
+      compute_AWB_coefficients(*rgb_img_ptr);
+    }
+#ifdef __ARM_NEON__
+    correct_white_balance_coefficients_neon(rgb_img_ptr);
+#else
+    correct_white_balance_coefficients(rgb_img_ptr);
+#endif  // __ARM_NEON__
+  }
+
+  inline void run_original(cv::Mat* rgb_img_ptr) {
     XP_CHECK_EQ(rgb_img_ptr != NULL, true);
     XP_CHECK_EQ(rgb_img_ptr->channels(), 3);
     XP_CHECK_EQ(rgb_img_ptr->type(), CV_8UC3);
@@ -80,6 +95,7 @@ class AutoWhiteBalance {
 
 bool computeNewAecTableIndex(const cv::Mat& raw_img,
                              const bool smooth_aec,
+                             const uint32_t AEC_steps,
                              int* aec_index_ptr);
 
 int sampleBrightnessHistogram(const cv::Mat& raw_img,

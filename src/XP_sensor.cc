@@ -17,6 +17,7 @@
 #include <driver/helper/xp_logging.h>
 #include <driver/XP_sensor.h>
 #include <driver/xp_aec_table.h>
+#include <driver/AR0141_aec_table.h>
 #include <driver/v4l2.h>
 #include <driver/firmware_config.h>
 #include <stdlib.h>
@@ -50,8 +51,9 @@
 #define CY_FX_UVC_XU_REG_RW                                 (uint16_t)(0x0e00)
 #define CY_FX_UVC_XU_HVER_RW                                (uint16_t)(0x0f00)
 #define CY_FX_UVC_XU_FLAG_RW                                (uint16_t)(0x1000)
-#define CY_FX_UVC_XU_TLC_RW                                 (uint16_t)(0x1100)
+#define CY_FX_UVC_XU_IR_RW                                  (uint16_t)(0x1100)
 #define CY_FX_UVC_XU_SPLAH_RW                               (uint16_t)(0x1200)
+#define CY_FX_UVC_XU_DEBUG_RW                               (uint16_t)(0x1300)
 
 // firmeware flag Bit
 #define DEBUG_DBG_BIT           (0x01 << 0)
@@ -91,7 +93,6 @@
 
 namespace XPDRIVER {
 namespace XP_SENSOR {
-static struct XPSensorSpec XP_sensor_spec;
 
 uint64_t get_timestamp_in_img(const uint8_t* data) {
   uint64_t clock_count_with_overflow;
@@ -113,27 +114,25 @@ bool stamp_timestamp_in_img(uint8_t* data, uint64_t time) {
 }
 
 #ifdef __linux__  // predefined by gcc
-
 // [NOTE] We make sure the firmware version is readable and matches the minimum requirement.
 bool get_XP_sensor_spec(int fd, XPSensorSpec* XP_sensor_spec_ptr) {
   // resolution
-  get_v4l2_resolution(fd, &(XP_sensor_spec.ColNum), &(XP_sensor_spec.RowNum));
+  get_v4l2_resolution(fd, &(XP_sensor_spec_ptr->ColNum), &(XP_sensor_spec_ptr->RowNum));
 
   // read sensor type (hardware version)
-  XP_sensor_spec.sensor_type = read_hard_version(fd);
+  XP_sensor_spec_ptr->sensor_type = read_hard_version(fd);
 
   // read soft version and check for minimum firmware version requirement
-  bool ok = (read_soft_version(fd, XP_sensor_spec.Soft_ver) &&
-             check_min_soft_version(XP_sensor_spec.Soft_ver));
+  bool ok = (read_soft_version(fd, XP_sensor_spec_ptr->Soft_ver_string) &&
+             check_min_soft_version(XP_sensor_spec_ptr->Soft_ver_string,
+                                    &(XP_sensor_spec_ptr->firmware_soft_version)));
   if (!ok) {
     printf("*** Please update firmware ***\n");
   }
 
   // read device ID
-  read_deviceID(fd, XP_sensor_spec.dev_id);
+  read_deviceID(fd, XP_sensor_spec_ptr->dev_id);
 
-  // Copy XPSensorSpec
-  *XP_sensor_spec_ptr = XP_sensor_spec;
   return ok;
 }
 
@@ -245,38 +244,75 @@ bool set_register(int fd, int16_t regaddr, int16_t regval) {
   }
   return true;
 }
-
-// control infrared light brightness function of firmware with TLC59116 chip, default is disable.
-// on_Mode: tlc59116 wok on full output of some channel.
-// pwm_Mode: tlc59116 work on pwm mode.
-bool xp_infrared_ctl(int fd, infrared_mode_t infrared_mode, uint16_t channel_value,
-                     uint8_t pwm_value) {
-  tlc59116_ctl_t tl59116_ctrl;
+// debug control
+bool xp_set_debug_variable(int fd, uint8_t* debug_ptr, uint32_t len) {
+  uint8_t value[255] = {0};
+  struct uvc_xu_control_query xu_query;
+  memcpy(value, debug_ptr, len);
+  xu_query.unit = 3;  // has to be unit 3
+  xu_query.selector = CY_FX_UVC_XU_DEBUG_RW >> 8;
+  xu_query.query = UVC_SET_CUR;
+  xu_query.size = 255;
+  xu_query.data = value;
+  if (ioctl(fd, UVCIOC_CTRL_QUERY, &xu_query) != 0) {
+    error_handle("xp_set_firmware_debug:set");
+    return false;
+  }
+  return true;
+}
+// control infrared light brightness function of firmware with TLC59116 chip.
+bool xp_infrared_ctl(int fd, infrared_mode_t infrared_mode, uint8_t pwm_value, uint8_t period) {
+  IR_ctl_t XPIRLx_IR_ctrl;
   uint8_t value[4] = {0};
   struct uvc_xu_control_query xu_query;
-  if (infrared_mode == off) {
-    tl59116_ctrl.SetCH_on_mode = 0;
-    tl59116_ctrl.SetCH_pwm_mode = 0;
-  } else if (infrared_mode == on) {
-    tl59116_ctrl.SetCH_on_mode = 1;
-    tl59116_ctrl.SetCH_pwm_mode = 0;
-  } else if (infrared_mode == pwm) {
-    tl59116_ctrl.SetCH_on_mode = 0;
-    tl59116_ctrl.SetCH_pwm_mode = 1;
-    tl59116_ctrl.pwm_value = pwm_value;
+  if (infrared_mode == OFF) {
+    XPIRLx_IR_ctrl.Set_infrared_mode = 0;
+    XPIRLx_IR_ctrl.Set_structured_mode = 0;
+    XPIRLx_IR_ctrl.RGB_IR_period = 0;
+    printf("IR control: close Infrared and structured light\n");
+  } else if (infrared_mode == INFRARED) {
+    XPIRLx_IR_ctrl.Set_infrared_mode = 1;
+    XPIRLx_IR_ctrl.Set_structured_mode = 0;
+    XPIRLx_IR_ctrl.pwm_value = pwm_value;
+    if (period > 0) {
+      XPIRLx_IR_ctrl.RGB_IR_period = period;
+    } else {
+      printf("RGB_IR_period can't be zero and have reset to 1 when open infrared light\n");
+      XPIRLx_IR_ctrl.RGB_IR_period = 1;
+    }
+    printf("IR control: Only open Infrared light, pwm_value = %d\n", pwm_value);
+  } else if (infrared_mode == STRUCTURED) {
+    XPIRLx_IR_ctrl.Set_infrared_mode = 0;
+    XPIRLx_IR_ctrl.Set_structured_mode = 1;
+    XPIRLx_IR_ctrl.pwm_value = pwm_value;
+    if (period > 0) {
+      XPIRLx_IR_ctrl.RGB_IR_period = period;
+    } else {
+      printf("RGB_IR_period can't be zero and have reset to 1 when open structured light\n");
+      XPIRLx_IR_ctrl.RGB_IR_period = 1;
+    }
+    printf("IR control: Only open structured light, pwm_value = %d\n", pwm_value);
+  } else if (infrared_mode == ALL_LIGHT) {
+    XPIRLx_IR_ctrl.Set_infrared_mode = 1;
+    XPIRLx_IR_ctrl.Set_structured_mode = 1;
+    XPIRLx_IR_ctrl.pwm_value = pwm_value;
+    if (period > 0) {
+      XPIRLx_IR_ctrl.RGB_IR_period = period;
+    } else {
+      printf("RGB_IR_period can't be zero and have reset to 1 when open all light\n");
+      XPIRLx_IR_ctrl.RGB_IR_period = 1;
+    }
+    printf("IR control: open Both infrared and structured light, pwm_value = %d\n", pwm_value);
   }
-  tl59116_ctrl.channel_value = channel_value;
-  tl59116_ctrl.UpdateBit = 1;
-  printf("infrared mode: %d, channel_value = %d  pwm_value = %d\n", infrared_mode,
-                                                                    channel_value,
-                                                                    pwm_value);
-  uint32_t* tl59116_ctrl_p = reinterpret_cast<uint32_t *> (&tl59116_ctrl);
-  value[0] = *tl59116_ctrl_p >> 24;
-  value[1] = *tl59116_ctrl_p >> 16;
-  value[2] = *tl59116_ctrl_p >> 8;
-  value[3] = *tl59116_ctrl_p >> 0;
+  XPIRLx_IR_ctrl.UpdateBit = 1;
+
+  uint32_t* XPIRLx_IR_ctrl_p = reinterpret_cast<uint32_t *> (&XPIRLx_IR_ctrl);
+  value[0] = *XPIRLx_IR_ctrl_p >> 24;
+  value[1] = *XPIRLx_IR_ctrl_p >> 16;
+  value[2] = *XPIRLx_IR_ctrl_p >> 8;
+  value[3] = *XPIRLx_IR_ctrl_p >> 0;
   xu_query.unit = 3;  // has to be unit 3
-  xu_query.selector = CY_FX_UVC_XU_TLC_RW >> 8;
+  xu_query.selector = CY_FX_UVC_XU_IR_RW >> 8;
   xu_query.query = UVC_SET_CUR;
   xu_query.size = 4;
   xu_query.data = value;
@@ -286,32 +322,10 @@ bool xp_infrared_ctl(int fd, infrared_mode_t infrared_mode, uint16_t channel_val
   }
   return true;
 }
-// firmware wil dump all tlc59116 register by uart after set this ioctl
-bool xp_tl59116_dump_register(int fd) {
-  tlc59116_ctl_t tl59116_ctrl;
-  uint8_t value[4] = {0};
-  struct uvc_xu_control_query xu_query;
-  tl59116_ctrl.dumpRegister = 1;
-  tl59116_ctrl.UpdateBit = 1;
-  uint32_t* tl59116_ctrl_p = reinterpret_cast<uint32_t *> (&tl59116_ctrl);
-  value[0] = *tl59116_ctrl_p >> 24;
-  value[1] = *tl59116_ctrl_p >> 16;
-  value[2] = *tl59116_ctrl_p >> 8;
-  value[3] = *tl59116_ctrl_p >> 0;
-  xu_query.unit = 3;  // has to be unit 3
-  xu_query.selector = CY_FX_UVC_XU_TLC_RW >> 8;
-  xu_query.query = UVC_SET_CUR;
-  xu_query.size = 4;
-  xu_query.data = value;
-  if (ioctl(fd, UVCIOC_CTRL_QUERY, &xu_query) != 0) {
-    error_handle("xp_tl59116_ctl:set");
-    return false;
-  }
-  return true;
-}
+
 // enable or disable imu embed img function of firmware, default is enable.
 bool xp_imu_embed_img(int fd, bool enable) {
-  uint32_t firmware_ctrl_flag;
+  struct firmware_ctl_t* firmware_ctrl_flag;
   uint8_t value[4] = {0};
   struct uvc_xu_control_query xu_query;
 
@@ -324,19 +338,20 @@ bool xp_imu_embed_img(int fd, bool enable) {
     error_handle("xp_imu_embed_img:get");
     return false;
   }
-  firmware_ctrl_flag = value[0] << 24 | value[1] << 16 | value[2] << 24 | value[3];
+  uint32_t ctl_tmp = (value[0] << 24 | value[1] << 16 | value[2] << 8 | value[3]);
+  firmware_ctrl_flag = reinterpret_cast<struct firmware_ctl_t* >(&ctl_tmp);
   usleep(1000);
   xu_query.selector = CY_FX_UVC_XU_FLAG_RW >> 8;
   xu_query.query = UVC_SET_CUR;
   if (enable) {
-    firmware_ctrl_flag = firmware_ctrl_flag | IMU_FROM_IMAGE_BIT;
+    firmware_ctrl_flag->imu_from_image = 1;
   } else {
-    firmware_ctrl_flag = firmware_ctrl_flag & (~IMU_FROM_IMAGE_BIT);
+    firmware_ctrl_flag->imu_from_image = 0;
   }
-  value[0] = firmware_ctrl_flag >> 24;
-  value[1] = firmware_ctrl_flag >> 16;
-  value[2] = firmware_ctrl_flag >> 8;
-  value[3] = firmware_ctrl_flag >> 0;
+  value[0] = ctl_tmp >> 24;
+  value[1] = ctl_tmp >> 16;
+  value[2] = ctl_tmp >> 8;
+  value[3] = ctl_tmp >> 0;
   if (ioctl(fd, UVCIOC_CTRL_QUERY, &xu_query) != 0) {
     error_handle("xp_imu_embed_img:set");
     return false;
@@ -376,13 +391,13 @@ bool convert_soft_version(const char* soft_ver, struct XpSoftVersion* ver_unit) 
   return (ret == 3);
 }
 
-bool check_min_soft_version(const char* soft_ver) {
+bool check_min_soft_version(const char* soft_ver, XpSoftVersion* firmware_soft_ver) {
   // get current firmware soft version
-  if (!convert_soft_version(soft_ver, &XP_sensor_spec.firmware_soft_version)) {
+  if (!convert_soft_version(soft_ver, firmware_soft_ver)) {
     XP_LOG_ERROR("Incorrect firmware version format!");
     return false;
   }
-  XpSoftVersion& firmware_ver = XP_sensor_spec.firmware_soft_version;
+  XpSoftVersion& firmware_ver = *firmware_soft_ver;
   bool ver_ok = false;
   if (firmware_ver.soft_ver_major < MIN_FIRMWARE_VERSION_MAJOR) {
     ver_ok = false;
@@ -400,7 +415,7 @@ bool check_min_soft_version(const char* soft_ver) {
     }
   }
 
-  printf("Current  firmware version: %d.%d.%d\n",
+  printf("Current firmware version: %d.%d.%d\n",
          firmware_ver.soft_ver_major,
          firmware_ver.soft_ver_minor,
          firmware_ver.soft_ver_patch);
@@ -447,8 +462,7 @@ SensorType read_hard_version(int fd) {
       sensor_type = SensorType::XP3;
       break;
     case 3:
-      // driver don't support XP3s now
-      // sensor_type = SensorType::XP3s;
+      // driver don't support XP3s
       sensor_type = SensorType::Unkown_sensor;
       break;
     case 4:
@@ -457,11 +471,13 @@ SensorType read_hard_version(int fd) {
     case 5:
       sensor_type = SensorType::XPIRL2;
       break;
+    case 6:
+      sensor_type = SensorType::XPIRL3;
+      break;
     default:
       sensor_type = SensorType::Unkown_sensor;
       break;
   }
-  printf("hardware version num: %d\r\n", hardware_version_num);
 
   return sensor_type;
 }
@@ -492,9 +508,9 @@ void read_deviceID(int fd, char* device_id) {
 
 bool set_registers_to_default(int v4l2_dev, SensorType sensor_type, int aec_index,
                               bool verbose, uint32_t* exp_ptr, uint32_t* gain_ptr) {
-  if (sensor_type == SensorType::XPIRL2) {
-  // TODO(zhoury): add exposure init for XPIRL2
-
+  if (sensor_type == SensorType::XPIRL2 || sensor_type == SensorType::XPIRL3) {
+    set_register(v4l2_dev, 0x3060, kAR0141_AEC_LUT[aec_index][0]);  // gain
+    set_register(v4l2_dev, 0x3012, kAR0141_AEC_LUT[aec_index][1]);  // exposure
   } else {
     set_register(v4l2_dev, 0x0B, kAEC_LUT[aec_index][1]);  // COARSE_SHUTTER_WIDTH_TOTAL_CONTEXTA
     set_register(v4l2_dev, 0x35, kAEC_LUT[aec_index][0]);  // GLOBAL_GAIN_CONTEXTA_REG
@@ -545,14 +561,23 @@ bool set_registers_to_default(int v4l2_dev, SensorType sensor_type, int aec_inde
   return true;
 }
 
-bool set_aec_index(int fd, uint32_t aec_index, bool verbose) {
+bool set_aec_index(int fd, uint32_t aec_index, SensorType sensor_type, bool verbose) {
   XP_CHECK_GE(aec_index, 0);
-  XP_CHECK_LT(aec_index, kAEC_steps);
-
-  int16_t gain_reg_val = kAEC_LUT[aec_index][0];
-  int16_t exp_reg_val =  kAEC_LUT[aec_index][1];
-  set_register(fd, 0x0B, exp_reg_val);  // COARSE_SHUTTER_WIDTH_TOTAL_CONTEXTA
-  set_register(fd, 0x35, gain_reg_val);  // GLOBAL_GAIN_CONTEXTA_REG
+  int16_t gain_reg_val;
+  int16_t exp_reg_val;
+  if (sensor_type == SensorType::XPIRL2 || sensor_type == SensorType::XPIRL3) {
+    XP_CHECK_LT(aec_index, kAR0141_AEC_steps);
+    gain_reg_val = kAR0141_AEC_LUT[aec_index][0];
+    exp_reg_val =  kAR0141_AEC_LUT[aec_index][1];
+    set_register(fd, 0x3060, gain_reg_val);  // gain
+    set_register(fd, 0x3012, exp_reg_val);   // exposure
+  } else {
+    XP_CHECK_LT(aec_index, kAEC_steps);
+    gain_reg_val = kAEC_LUT[aec_index][0];
+    exp_reg_val =  kAEC_LUT[aec_index][1];
+    set_register(fd, 0x0B, exp_reg_val);   // COARSE_SHUTTER_WIDTH_TOTAL_CONTEXTA
+    set_register(fd, 0x35, gain_reg_val);  // GLOBAL_GAIN_CONTEXTA_REG
+  }
   if (verbose) {
     printf("aec index %d, reg val gain = %d  exp = %d\n", aec_index, gain_reg_val, exp_reg_val);
   }
@@ -610,76 +635,7 @@ int set_auto_exp_and_gain(int fd, bool ae, bool ag) {
 }
 */
 #endif  // __linux__
-OpencvVideoCap::OpencvVideoCap(int vid) {
-  cap_.open(vid);  // open the default camera
-  if (!cap_.isOpened()) {
-    XP_LOG_ERROR("opencv cam " << vid << " cannot be opened");
-  }
-}
-OpencvVideoCap::~OpencvVideoCap() {}
-bool OpencvVideoCap::retrive(std::shared_ptr<std::vector<uint8_t>> data_ptr) {
-  XP_CHECK_NOTNULL(data_ptr.get());
-  cap_ >> frame_cache_;  // get a new frame from camera
-  XP_CHECK_EQ(frame_cache_.step1(), W * 3);
-  XP_CHECK_EQ(frame_cache_.type(), CV_8UC3);
-  XP_CHECK_EQ(frame_cache_.channels(), 3);
-  const int len = frame_cache_.cols * frame_cache_.rows * frame_cache_.channels();
-  if (data_ptr->size() != len) {
-      data_ptr->resize(len);
-  }
-  memcpy(&(data_ptr->at(0)), frame_cache_.data, len);
-  return true;
-}
-bool OpencvVideoCap::copy_to_lr(cv::Mat* img_l_ptr, cv::Mat* img_r_ptr, uint8_t* img_data) {
-  XP_CHECK_NOTNULL(img_l_ptr);
-  XP_CHECK_NOTNULL(img_r_ptr);
-  cv::Mat& img_l = *img_l_ptr;
-  cv::Mat& img_r = *img_r_ptr;
-  XP_CHECK_EQ(img_l.rows, H);
-  XP_CHECK_EQ(img_l.cols, W);
-  XP_CHECK_EQ(img_r.rows, H);
-  XP_CHECK_EQ(img_r.cols, W);
-  XP_CHECK_EQ(img_r.type(), CV_8UC1);
-  XP_CHECK_EQ(img_r.type(), CV_8UC1);
-  img_l.setTo(0x00);
-  img_r.setTo(0x00);
-  const int shift_constant = W * H * 1;
-  for (int i = 0; i < H; i += 2) {
-    for (int j = 0; j < W / 2; j += 1) {
-      // we see aliasing effect somehow.
-      // here is a trick
-      int v1 = static_cast<int>(
-          img_data[i       * W * 2 + j * 2 + 0 +shift_constant + XP_IMG_WIDTH]);
-      int v2 = static_cast<int>(
-          img_data[(i + 1) * W * 2 + j * 2 + 0 + shift_constant + XP_IMG_WIDTH]);
-      img_l.at<uint8_t>(XP_IMG_HEIGHT - i - 1, j + 0) = (v1 + v2) / 2;
-      img_l.at<uint8_t>(XP_IMG_HEIGHT - i - 2, j + 0) = (v1 + v2) / 2;
-      v1 = static_cast<int>(
-          img_data[i       * W * 2 + j * 2 + 1 + shift_constant + XP_IMG_WIDTH]);
-      v2 = static_cast<int>(
-          img_data[(i + 1) * W * 2 + j * 2 + 1 + shift_constant + XP_IMG_WIDTH]);
-      img_r.at<uint8_t>(XP_IMG_HEIGHT - i - 1, j + 0) = (v1 + v2) / 2;
-      img_r.at<uint8_t>(XP_IMG_HEIGHT - i - 2, j + 0) = (v1 + v2) / 2;
-    }
-    for (int j = W / 2; j < W; j += 1) {
-      // we see aliasing effect somehow.
-      // here is a trick
-      int v1 = static_cast<int>(
-          img_data[i       * W * 2 + j * 2 + 0 + shift_constant - XP_IMG_WIDTH]);
-      int v2 = static_cast<int>(
-          img_data[(i + 1) * W * 2 + j * 2 + 0 + shift_constant - XP_IMG_WIDTH]);
-      img_l.at<uint8_t>(XP_IMG_HEIGHT - i - 1, j + 0) = (v1 + v2) / 2;
-      img_l.at<uint8_t>(XP_IMG_HEIGHT - i - 2, j + 0) = (v1 + v2) / 2;
-      v1 = static_cast<int>(
-          img_data[i       * W * 2 + j * 2 + 1 + shift_constant - XP_IMG_WIDTH]);
-      v2 = static_cast<int>(
-          img_data[(i + 1) * W * 2 + j * 2 + 1 + shift_constant - XP_IMG_WIDTH]);
-      img_r.at<uint8_t>(XP_IMG_HEIGHT - i - 1, j + 0) = (v1 + v2) / 2;
-      img_r.at<uint8_t>(XP_IMG_HEIGHT - i - 2, j + 0) = (v1 + v2) / 2;
-    }
-  }
-  return true;
-}
+
 #ifdef  __CYGWIN__
 SharedMemoryReader::SharedMemoryReader(const std::string& file) {
   HANDLE hMapFile = OpenFileMapping(FILE_MAP_ALL_ACCESS,   // read/write access
@@ -847,7 +803,9 @@ bool ImuReader::get_imu_from_img(const uint8_t* data,
   if (imu_sample_count_for_rate_ > 20) {
     const int time_us = std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now() - imu_sample_start_tp_).count();
-    imu_rate_ = 1000000 / (time_us / imu_sample_count_for_rate_);
+    if (time_us > 0) {
+      imu_rate_ = (1000000 * imu_sample_count_for_rate_) / time_us;
+    }
     imu_sample_start_tp_ = std::chrono::steady_clock::now();
     imu_sample_count_for_rate_ = 0;
   }
