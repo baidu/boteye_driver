@@ -21,28 +21,12 @@ find_package(Glog REQUIRED)
 find_package(GFlags REQUIRED)
 find_package(Eigen REQUIRED)
 include_directories(${EIGEN_INCLUDE_DIR})
-find_library(DEPTH_LIB
-NAME xpdepth 
-HINTS "${PROJECT_SOURCE_DIR}/libs"
-)
-find_library(PARAM_LIB
-NAME xpparam 
-HINTS "${PROJECT_SOURCE_DIR}/libs"
-)
+
 
 find_library(DRIVER_LIB
 NAME xpdriver
 HINTS "${PROJECT_SOURCE_DIR}/../build"
 )
-
-include_directories(${PROJECT_SOURCE_DIR}/../include/)
-include_directories(${PROJECT_SOURCE_DIR}/include/)
-set(SOURCE_DEPTH_APPS
-depth_demo.cpp
-)
-
-add_executable(depth_demo ${SOURCE_DEPTH_APPS})
-target_link_libraries(depth_demo ${OpenCV_LIBS} glog gflags ${DRIVER_LIB} ${DEPTH_LIB} ${PARAM_LIB})
 
 include_directories(${PROJECT_SOURCE_DIR}/../include/)
 set(SOURCE_APPS
@@ -52,4 +36,5 @@ driver_demo.cpp
 add_executable(driver_demo ${SOURCE_APPS})
 target_link_libraries(driver_demo ${OpenCV_LIBS} glog gflags ${DRIVER_LIB})
 
+add_subdirectory(depth_demo)
 add_subdirectory(tests)
