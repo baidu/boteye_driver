@@ -1,7 +1,6 @@
-README
-======
+![boteye](https://image.ibb.co/b1N40z/page_1_1.png)
 
-This is xPerception's driver for multiple types of camera modules.
+This is Baidu's boteye driver for multiple types of camera modules.
 
 ## Required dependencies (built from source): ##
  You can git clone the XP_3rdparty repo, which has all the source code of needed 3rdparty dependencies by other repos, but that's an overkill. You can just download the Opencv.
