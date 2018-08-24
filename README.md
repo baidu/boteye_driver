@@ -4,7 +4,6 @@
 This is Baidu's boteye driver for multiple types of camera modules.
 
 ## Required dependencies (built from source): ##
- You can git clone the XP_3rdparty repo, which has all the source code of needed 3rdparty dependencies by other repos, but that's an overkill. You can just download the Opencv.
 
 - Opencv 3.0.0
 
