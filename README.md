@@ -1,5 +1,6 @@
 ![boteye](https://image.ibb.co/b1N40z/page_1_1.png)
 
+## boteye_sensor
 This is Baidu's boteye driver for multiple types of camera modules.
 
 ## Required dependencies (built from source): ##
