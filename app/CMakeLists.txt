@@ -20,6 +20,7 @@ find_package(OpenCV 3.0.0 REQUIRED)
 find_package(Glog REQUIRED)
 find_package(GFlags REQUIRED)
 find_package(Eigen REQUIRED)
+find_package(Yaml REQUIRED)
 include_directories(${EIGEN_INCLUDE_DIR})
 
 

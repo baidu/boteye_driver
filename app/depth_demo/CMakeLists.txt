@@ -34,6 +34,7 @@ if ("${RELEASE_VERSION}" STREQUAL "16.04" OR "${RELEASE_VERSION}" STREQUAL "14.0
     ${OpenCV_LIBS}
     glog
     gflags
+    ${YAMLCPP_LIBRARIES}
     ${DRIVER_LIB}
     ${DEPTH_LIB}
     ${PARAM_LIB}
