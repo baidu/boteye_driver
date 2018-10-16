@@ -3,7 +3,7 @@
 # The following variables are optionally searched for defaults
 #  YAMLCPP_ROOT_DIR:            Base directory where all YAMLCPP components are found
 #
-# The following are set after configuration is done: 
+# The following are set after configuration is done:
 #  YAMLCPP_FOUND
 #  YAMLCPP_INCLUDE_DIRS
 #  YAMLCPP_LIBRARIES
