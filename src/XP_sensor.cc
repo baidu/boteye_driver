@@ -39,6 +39,7 @@
 #include <time.h>
 #endif  // __linux__
 #include <iostream>
+#include <fstream>
 
 // Uncomment for quick outdoor setting hack
 // #define OUTDOOR_SETTING
@@ -54,6 +55,7 @@
 #define CY_FX_UVC_XU_IR_RW                                  (uint16_t)(0x1100)
 #define CY_FX_UVC_XU_SPLAH_RW                               (uint16_t)(0x1200)
 #define CY_FX_UVC_XU_DEBUG_RW                               (uint16_t)(0x1300)
+#define CY_FX_UVC_XU_CALIB_RW                               (uint16_t)(0x1400)
 
 // firmeware flag Bit
 #define DEBUG_DBG_BIT           (0x01 << 0)
@@ -79,6 +81,8 @@
 #endif
 #define XP_IMG_HEIGHT 480
 #define FLASH_RW_LEN  255
+#define CALIB_RW_LEN  255
+#define PAYLOAD_LEN   (CALIB_RW_LEN - 7)
 
 #define XP_H_BLANK 206
 #define XP_ROW_TIME (XP_IMG_WIDTH + XP_H_BLANK)  // min val 704.  Fixed at 846
@@ -91,6 +95,51 @@
 #define XP_BOARD_MIN_GAIN 0x10  // 16
 #define XP_BOARD_MAX_EXP (XP_IMG_HEIGHT + XP_V_BLANK - 2)  // 1274 for VGA @ 25 Hz
 
+// TODO(huyuexiang) take care of alignment if using other kind of member!
+typedef struct {
+  uint8_t header[2];                 // header[0]=0xAA, header[1]=0x55
+  uint8_t packet_total;              // indicates how many packets
+  uint8_t packet_len;                // length of packet in bytes, including check_sum
+  uint8_t id;                        // start from 0 to 255
+  uint8_t data[PAYLOAD_LEN];         // payload
+  uint8_t check_sum[2];              // check sum from header[0] to data[PAYLOAD_LEN-1],
+                                     // LSB first, MSB last
+} calib_struct_t;
+calib_struct_t device_data;
+static const uint16_t wCRC16Table[256] = {
+  0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
+  0xC601, 0x06C0, 0x0780, 0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440,
+  0xCC01, 0x0CC0, 0x0D80, 0xCD41, 0x0F00, 0xCFC1, 0xCE81, 0x0E40,
+  0x0A00, 0xCAC1, 0xCB81, 0x0B40, 0xC901, 0x09C0, 0x0880, 0xC841,
+  0xD801, 0x18C0, 0x1980, 0xD941, 0x1B00, 0xDBC1, 0xDA81, 0x1A40,
+  0x1E00, 0xDEC1, 0xDF81, 0x1F40, 0xDD01, 0x1DC0, 0x1C80, 0xDC41,
+  0x1400, 0xD4C1, 0xD581, 0x1540, 0xD701, 0x17C0, 0x1680, 0xD641,
+  0xD201, 0x12C0, 0x1380, 0xD341, 0x1100, 0xD1C1, 0xD081, 0x1040,
+  0xF001, 0x30C0, 0x3180, 0xF141, 0x3300, 0xF3C1, 0xF281, 0x3240,
+  0x3600, 0xF6C1, 0xF781, 0x3740, 0xF501, 0x35C0, 0x3480, 0xF441,
+  0x3C00, 0xFCC1, 0xFD81, 0x3D40, 0xFF01, 0x3FC0, 0x3E80, 0xFE41,
+  0xFA01, 0x3AC0, 0x3B80, 0xFB41, 0x3900, 0xF9C1, 0xF881, 0x3840,
+  0x2800, 0xE8C1, 0xE981, 0x2940, 0xEB01, 0x2BC0, 0x2A80, 0xEA41,
+  0xEE01, 0x2EC0, 0x2F80, 0xEF41, 0x2D00, 0xEDC1, 0xEC81, 0x2C40,
+  0xE401, 0x24C0, 0x2580, 0xE541, 0x2700, 0xE7C1, 0xE681, 0x2640,
+  0x2200, 0xE2C1, 0xE381, 0x2340, 0xE101, 0x21C0, 0x2080, 0xE041,
+  0xA001, 0x60C0, 0x6180, 0xA141, 0x6300, 0xA3C1, 0xA281, 0x6240,
+  0x6600, 0xA6C1, 0xA781, 0x6740, 0xA501, 0x65C0, 0x6480, 0xA441,
+  0x6C00, 0xACC1, 0xAD81, 0x6D40, 0xAF01, 0x6FC0, 0x6E80, 0xAE41,
+  0xAA01, 0x6AC0, 0x6B80, 0xAB41, 0x6900, 0xA9C1, 0xA881, 0x6840,
+  0x7800, 0xB8C1, 0xB981, 0x7940, 0xBB01, 0x7BC0, 0x7A80, 0xBA41,
+  0xBE01, 0x7EC0, 0x7F80, 0xBF41, 0x7D00, 0xBDC1, 0xBC81, 0x7C40,
+  0xB401, 0x74C0, 0x7580, 0xB541, 0x7700, 0xB7C1, 0xB681, 0x7640,
+  0x7200, 0xB2C1, 0xB381, 0x7340, 0xB101, 0x71C0, 0x7080, 0xB041,
+  0x5000, 0x90C1, 0x9181, 0x5140, 0x9301, 0x53C0, 0x5280, 0x9241,
+  0x9601, 0x56C0, 0x5780, 0x9741, 0x5500, 0x95C1, 0x9481, 0x5440,
+  0x9C01, 0x5CC0, 0x5D80, 0x9D41, 0x5F00, 0x9FC1, 0x9E81, 0x5E40,
+  0x5A00, 0x9AC1, 0x9B81, 0x5B40, 0x9901, 0x59C0, 0x5880, 0x9841,
+  0x8801, 0x48C0, 0x4980, 0x8941, 0x4B00, 0x8BC1, 0x8A81, 0x4A40,
+  0x4E00, 0x8EC1, 0x8F81, 0x4F40, 0x8D01, 0x4DC0, 0x4C80, 0x8C41,
+  0x4400, 0x84C1, 0x8581, 0x4540, 0x8701, 0x47C0, 0x4680, 0x8641,
+  0x8201, 0x42C0, 0x4380, 0x8341, 0x4100, 0x81C1, 0x8081, 0x4040
+};
 namespace XPDRIVER {
 namespace XP_SENSOR {
 
@@ -365,21 +414,32 @@ bool xp_imu_embed_img(int fd, bool enable) {
  *  @return     NULL.
  */
 bool read_soft_version(int fd, char* soft_ver_ptr) {
-  // TODO(renyi): Verify if this string length is proper or should we use hardcoded 64.
-  #define FIRMWARE_VERSION_EXAMPLE "V0.6.4-0a685d0-dirty!"
   uint8_t value[64] = {0};
+  uint8_t length = 0;
   struct uvc_xu_control_query xu_query;
+  // Firstly, get version length
+  xu_query.unit = 3;  // has to be unit 3
+  xu_query.selector = CY_FX_UVC_XU_SVER_RW >> 8;
+  xu_query.query = UVC_GET_LEN;
+  xu_query.size = 2;
+  xu_query.data = value;
+  if (ioctl(fd, UVCIOC_CTRL_QUERY, &xu_query) != 0) {
+    error_handle("read_soft_version_length:get");
+    return false;
+  }
+  length = value[0];
+
+  // Secondly, obtain version
   xu_query.unit = 3;  // has to be unit 3
   xu_query.selector = CY_FX_UVC_XU_SVER_RW >> 8;
   xu_query.query = UVC_GET_CUR;
-  xu_query.size = strlen(FIRMWARE_VERSION_EXAMPLE);
+  xu_query.size = length;
   xu_query.data = value;
-
   if (ioctl(fd, UVCIOC_CTRL_QUERY, &xu_query) != 0) {
     error_handle("read_soft_version:get");
     return false;
   }
-  memcpy(soft_ver_ptr, value, strlen(FIRMWARE_VERSION_EXAMPLE));
+  memcpy(soft_ver_ptr, value, length);
   return true;
 }
 
@@ -474,6 +534,9 @@ SensorType read_hard_version(int fd) {
     case 6:
       sensor_type = SensorType::XPIRL3;
       break;
+    case 7:
+      sensor_type = SensorType::XPIRL3_A;
+      break;
     default:
       sensor_type = SensorType::Unkown_sensor;
       break;
@@ -490,6 +553,7 @@ SensorType read_hard_version(int fd) {
 void read_deviceID(int fd, char* device_id) {
   uint8_t value[255] = {0};
   struct uvc_xu_control_query xu_query;
+  char *p;
 
   xu_query.unit =  3;
   xu_query.selector = CY_FX_UVC_XU_SPLAH_RW >> 8;
@@ -502,13 +566,203 @@ void read_deviceID(int fd, char* device_id) {
   } else {
     // TODO(renyi): Check for unset device ID in firmware and replaced with "unknown" here
     memcpy(device_id, xu_query.data, 100);
-    printf("device ID: %s\n", device_id);
+    // The way to check device ID:
+    // 1. If there is no '\0', the device ID is "unknown" obviously.
+    // 2. If the characters before '\0' are all among 32 and 126, the device ID should be legal.
+    p = strchr(device_id, '\0');
+    if (p) {
+      for (int i = 0; i < p - device_id; i++) {
+        // illegal character, print "unknown"
+        if (device_id[i] < 32 || device_id[i] > 126) {
+          device_id[0] = '\0';
+          printf("device ID: unknown\n");
+          return;
+        }
+      }
+      printf("device ID: %s\n", device_id);
+    } else {
+      // no '\0' means invalid ID, just print "unknown"
+      device_id[0] = '\0';
+      printf("device ID: unknown\n");
+    }
   }
+}
+
+void make_crc16(const uint8_t* pDataIn, int iLenIn, uint16_t* pCRCOut) {
+  uint16_t wResult = 0;
+  uint16_t wTableNo = 0;
+  int i = 0;
+  for ( i = 0; i < iLenIn; i++ ) {
+    wTableNo = ((wResult & 0xff) ^ (pDataIn[i] & 0xff));
+    wResult = ((wResult >> 8) & 0xff) ^ wCRC16Table[wTableNo];
+  }
+  *pCRCOut = wResult;
+}
+bool verify_crc16(const uint8_t* pDataIn, int iLenIn) {
+  uint8_t crc_buf[2] = {0};
+  uint16_t check_sum = 0;
+  make_crc16(pDataIn, iLenIn - 2, &check_sum);
+  crc_buf[0] = check_sum & 0xFF;
+  crc_buf[1] = (check_sum >> 8) & 0xFF;
+  if (pDataIn[iLenIn - 2] == crc_buf[0]) {
+    if (pDataIn[iLenIn - 1] == crc_buf[1]) {
+      return true;
+    }
+  }
+  return false;
+}
+/**
+ *  @brief      read calibration file from sensor flash.
+ *  @param[in]  dest_buffer: useful data from sensor.
+ *  @param[out] size: useful data length.
+ *  @return     true means success, false means fail.
+ */
+bool read_calib_from_device(int fd, uint8_t *dest_buffer, int *size) {
+  uint8_t packet_num = 1;
+  uint8_t packet_id = 0;
+  int read_len = 0;
+  struct uvc_xu_control_query xu_query;
+
+  xu_query.unit =  3;
+  xu_query.selector = CY_FX_UVC_XU_CALIB_RW >> 8;
+  xu_query.query = UVC_GET_CUR;
+  xu_query.size = CALIB_RW_LEN;
+  xu_query.data = reinterpret_cast<uint8_t *>(&device_data);
+
+  memset(reinterpret_cast<uint8_t *>(&device_data), 0, sizeof(calib_struct_t));
+
+  do {
+    if (ioctl(fd, UVCIOC_CTRL_QUERY, &xu_query) != 0) {
+      error_handle();
+      *size = 0;
+      return false;
+    }
+    if ((device_data.header[0] != 0xAA) || (device_data.header[1] != 0x55)) {
+      printf("wrong packet header from device: [0x%x] [0x%x]\n", \
+            device_data.header[0], device_data.header[1]);
+      *size = 0;
+      return false;
+    }
+    if (verify_crc16(reinterpret_cast<uint8_t *>(&device_data),
+                      device_data.packet_len) == false) {
+      uint16_t check_sum;
+      printf("%dth packet CRC check failed!\n", device_data.id);
+      *size = 0;
+      return false;
+    }
+    packet_num = device_data.packet_total;
+    packet_id = device_data.id;
+    memcpy(&dest_buffer[packet_id * PAYLOAD_LEN], device_data.data, PAYLOAD_LEN);
+    read_len += PAYLOAD_LEN;
+    usleep(300000);
+  } while (packet_id < packet_num - 1);
+  printf("read %d bytes from device\n", read_len);
+
+  dest_buffer[read_len] = '\0';
+  *size = read_len;
+  return true;
+}
+
+bool read_calib_str_from_device(int fd, std::string *calib_str) {
+  int size;
+  bool ret = false;
+  char *buffer = new char[XP_SECTOR_MAX_LEN];
+  if (read_calib_from_device(fd, reinterpret_cast<uint8_t *>(buffer), &size)) {
+    *calib_str = buffer;
+    ret = true;
+  }
+  delete [] buffer;
+  return ret;
+}
+/**
+ *  @brief      write calibration file to sensor flash.
+ *  @param[in]  buffer: data to write.
+ *  @param[out] size: data length.
+ *  @return     NULL.
+ */
+void write_calib_to_device(int fd, uint8_t *buffer, int size) {
+  uint8_t i, j;
+  uint8_t packet_num;
+  uint8_t packet_id;
+  uint16_t check_sum;
+  struct uvc_xu_control_query xu_query;
+
+  // TODO(huyuexiang): the size MUST be smaller than sector size 64KB, here defined 60KB.
+  assert(size <= XP_CALIB_MAX_LEN);
+
+  packet_num = size /PAYLOAD_LEN + (size % PAYLOAD_LEN ? 1 : 0);
+  packet_id = 0;
+  device_data.header[0] = 0xAA;
+  device_data.header[1] = 0x55;
+  device_data.packet_len = CALIB_RW_LEN;
+
+  xu_query.unit = 3;
+  xu_query.selector = CY_FX_UVC_XU_CALIB_RW >> 8;
+  xu_query.query = UVC_SET_CUR;
+  xu_query.size = CALIB_RW_LEN;
+  xu_query.data = reinterpret_cast<uint8_t *>(&device_data);
+
+  for (i = 0; i < packet_num; i++) {
+    packet_id = i;
+    device_data.packet_total = packet_num;
+    device_data.id = packet_id;
+
+    // the last packet, we should take care that the length maybe less than PAYLOAD_LEN.
+    // in that case, device_data.data[] must be init to '\0' first
+    if (i == packet_num -1) {
+      memset(device_data.data, '\0', PAYLOAD_LEN);
+      memcpy(device_data.data, &buffer[i * PAYLOAD_LEN], size - i * PAYLOAD_LEN);
+    } else {
+      memcpy(device_data.data, &buffer[i * PAYLOAD_LEN], PAYLOAD_LEN);
+    }
+    make_crc16(reinterpret_cast<uint8_t *>(&device_data),
+               device_data.packet_len - 2,
+               &check_sum);
+    device_data.check_sum[0] = check_sum & 0xFF;
+    device_data.check_sum[1] = (check_sum >> 8) & 0xFF;
+    if (ioctl(fd, UVCIOC_CTRL_QUERY, &xu_query) != 0) {
+      error_handle();
+    }
+    printf("write %dth packet to device\n", device_data.id);
+    if (packet_id == 0) {
+      // The first packet write should wait for a long time because of spiflash erase.
+      sleep(3);
+    } else {
+      usleep(100000);
+    }
+  }
+}
+
+void write_calib_str_to_device(int fd, const std::string &calib_str) {
+  int size = calib_str.length();
+  char *buffer = new char[size];
+  calib_str.copy(buffer, size, 0);
+  write_calib_to_device(fd, reinterpret_cast<uint8_t *>(buffer), size);
+  delete [] buffer;
+}
+
+void read_calib_from_file(const std::string &filename, uint8_t *buffer) {
+  std::cout << filename << std::endl;
+  std::ifstream in(filename);
+  int length;
+  if (!in.is_open()) {
+    XP_LOG_ERROR("Could not load calib file");
+    return;
+  }
+  in.seekg(0, std::ios::end);
+  length = in.tellg();
+  // TODO(huyuexiang): the size MUST be smaller than 1/2 sector size 64KB, here defined 30KB.
+  assert(length <= XP_CALIB_MAX_LEN / 2);
+  in.seekg(0, std::ios::beg);
+  in.read(reinterpret_cast<char *>(buffer), length);
+  in.close();
 }
 
 bool set_registers_to_default(int v4l2_dev, SensorType sensor_type, int aec_index,
                               bool verbose, uint32_t* exp_ptr, uint32_t* gain_ptr) {
-  if (sensor_type == SensorType::XPIRL2 || sensor_type == SensorType::XPIRL3) {
+  if (sensor_type == SensorType::XPIRL2 ||
+      sensor_type == SensorType::XPIRL3 ||
+      sensor_type == SensorType::XPIRL3_A) {
     set_register(v4l2_dev, 0x3060, kAR0141_AEC_LUT[aec_index][0]);  // gain
     set_register(v4l2_dev, 0x3012, kAR0141_AEC_LUT[aec_index][1]);  // exposure
   } else {
@@ -565,7 +819,9 @@ bool set_aec_index(int fd, uint32_t aec_index, SensorType sensor_type, bool verb
   XP_CHECK_GE(aec_index, 0);
   int16_t gain_reg_val;
   int16_t exp_reg_val;
-  if (sensor_type == SensorType::XPIRL2 || sensor_type == SensorType::XPIRL3) {
+  if (sensor_type == SensorType::XPIRL2 ||
+      sensor_type == SensorType::XPIRL3 ||
+      sensor_type == SensorType::XPIRL3_A) {
     XP_CHECK_LT(aec_index, kAR0141_AEC_steps);
     gain_reg_val = kAR0141_AEC_LUT[aec_index][0];
     exp_reg_val =  kAR0141_AEC_LUT[aec_index][1];
@@ -625,15 +881,6 @@ bool set_gain_percentage(int fd, int16_t val, bool verbose) {
   }
   return true;
 }
-
-/*
-int set_auto_exp_and_gain(int fd, bool ae, bool ag) {
-  // not working yet. Need to set more registers
-  int16_t ae_s = static_cast<int16_t>(ae);
-  int16_t ag_s = static_cast<int16_t>(ag);
-  return set_register(fd, 0xaf, ae_s | (ag_s << 1));
-}
-*/
 #endif  // __linux__
 
 #ifdef  __CYGWIN__

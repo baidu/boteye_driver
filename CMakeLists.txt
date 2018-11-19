@@ -42,8 +42,8 @@ project(xpdriver)
 
 # Define the minimum supported firmware version number and generate the firmware_config.h
 set(MIN_FIRMWARE_VERSION_MAJOR 0)
-set(MIN_FIRMWARE_VERSION_MINOR 8)
-set(MIN_FIRMWARE_VERSION_PATCH 5)
+set(MIN_FIRMWARE_VERSION_MINOR 9)
+set(MIN_FIRMWARE_VERSION_PATCH 8)
 configure_file(
  cmake/firmware_config.h.in
  ${PROJECT_SOURCE_DIR}/include/driver/firmware_config.h
@@ -101,15 +101,18 @@ set(DRIVER_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/include"
  CACHE string "driver includes")
 
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
-target_include_directories(${PROJECT_NAME} PUBLIC ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(${PROJECT_NAME} ${OpenCV_LIBS})
 
+if (NOT RELEASE_PROJECT)
+  set(RELEASE_PROJECT "XP")
+endif()
+message("xp driver release project name: ${RELEASE_PROJECT}")
 # For binary release
 install(TARGETS ${PROJECT_NAME}
-  LIBRARY DESTINATION XP/lib_${CMAKE_SYSTEM_PROCESSOR}
-  RUNTIME DESTINATION XP/lib_${CMAKE_SYSTEM_PROCESSOR}  # for cygwin
-  ARCHIVE DESTINATION XP/lib_${CMAKE_SYSTEM_PROCESSOR}  # for cygwin
+  LIBRARY DESTINATION ${RELEASE_PROJECT}/lib_${CMAKE_SYSTEM_PROCESSOR}
+  RUNTIME DESTINATION ${RELEASE_PROJECT}/lib_${CMAKE_SYSTEM_PROCESSOR}  # for cygwin
+  ARCHIVE DESTINATION ${RELEASE_PROJECT}/lib_${CMAKE_SYSTEM_PROCESSOR}  # for cygwin
 )
 
 # We also need to install essential headers to work together with libxpdriver.so
-install(DIRECTORY include/driver DESTINATION XP/include)
+install(DIRECTORY include DESTINATION ${RELEASE_PROJECT})

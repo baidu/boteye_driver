@@ -17,9 +17,8 @@
 #define _GNU_SOURCE
 #endif
 #include <glog/logging.h>
+#include <gflags/gflags.h>
 #include <driver/helper/shared_queue.h>
-#include <driver/xp_aec_table.h>
-#include <driver/AR0141_aec_table.h>
 #include <driver/XP_sensor_driver.h>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
@@ -47,7 +46,7 @@ using XPDRIVER::SensorType;
 DEFINE_bool(auto_gain, false, "turn on auto gain");
 DEFINE_string(dev_name, "", "which video dev name to open. Empty enables auto mode");
 DEFINE_bool(imu_from_image, false, "Load imu from image. Helpful for USB2.0");
-DEFINE_string(sensor_type, "", "XP or XP2 or XP3 or FACE or XPIRL or XPIRL2, XPIRL3");
+DEFINE_string(sensor_type, "", "XP or XP2 or XP3 or FACE or XPIRL or XPIRL2 or XPIRL3, XPIRL3_A");
 DEFINE_bool(spacebar_mode, false, "only save img when press space bar");
 DEFINE_string(record_path, "", "path to save images. Set empty to disable saving");
 DEFINE_int32(ir_period, 2, "One IR image in every ir_period frames. 0: all RGBs, 1: all IRs,"
@@ -89,10 +88,6 @@ std::atomic<bool> run_flag;
 std::atomic<bool> save_img, save_ir_img;
 SensorType XP_sensor_type;
 // we use the first imu to approx img time based on img counter
-std::atomic<bool> g_auto_gain;
-XPDRIVER::XP_SENSOR::infrared_mode_t g_infrared_mode;
-int g_aec_index;  // signed int as the index may go to negative while calculation
-int g_infrared_index;
 cv::Size g_img_size;
 ImgForShow g_img_lr_display, g_img_lr_IR_display;
 bool g_has_IR;
@@ -136,8 +131,8 @@ bool create_directory(const std::string dir_name) {
 
 // Callback functions for XpSensorMultithread
 // [NOTE] These callback functions have to be light-weight as it *WILL* block XpSensorMultithread
-void image_data_callback(const cv::Mat& img_l, const cv::Mat& img_r, const float ts_100us,
-                         const std::chrono::time_point<std::chrono::steady_clock>& sys_time) {
+void steady_image_data_callback(const cv::Mat& img_l, const cv::Mat& img_r, const float ts_100us,
+                                const std::chrono::time_point<std::chrono::steady_clock>& steady_time) {
   if (run_flag) {
     StereoImage stereo_img;
     stereo_img.l = img_l;
@@ -147,8 +142,8 @@ void image_data_callback(const cv::Mat& img_l, const cv::Mat& img_r, const float
   }
 }
 
-void IR_data_callback(const cv::Mat& img_l, const cv::Mat& img_r, const float ts_100us,
-                      const std::chrono::time_point<std::chrono::steady_clock>& sys_time) {
+void steady_IR_data_callback(const cv::Mat& img_l, const cv::Mat& img_r, const float ts_100us,
+                             const std::chrono::time_point<std::chrono::steady_clock>& steady_time) {
   if (run_flag) {
     StereoImage IR_img;
     IR_img.l = img_l;
@@ -170,141 +165,6 @@ bool kill_all_shared_queues() {
   stereo_image_queue.kill();
   IR_image_queue.kill();
   imu_data_queue.kill();
-  return true;
-}
-
-bool process_ir_control(char keypressed) {
-  if (g_xp_sensor_ptr == nullptr) {
-    return false;
-  }
-  using XPDRIVER::XP_SENSOR::infrared_pwm_max;
-  // -1 means no key is pressed
-  if (g_infrared_mode != XPDRIVER::XP_SENSOR::OFF && keypressed != -1) {
-    int index_old = g_infrared_index;
-    switch (keypressed) {
-      case '6':
-        g_infrared_index = 1;
-        break;
-      case '7':
-        g_infrared_index = infrared_pwm_max * 0.2;
-        break;
-      case '8':
-        g_infrared_index = infrared_pwm_max * 0.6;
-        break;
-      case '9':
-        g_infrared_index = infrared_pwm_max - 10;
-        break;
-      case '.':
-        ++g_infrared_index;
-        if (g_infrared_index >= infrared_pwm_max) g_infrared_index = infrared_pwm_max -1;
-        break;
-      case '>':
-        g_infrared_index += 5;
-        if (g_infrared_index >= infrared_pwm_max) g_infrared_index = infrared_pwm_max -1;
-        break;
-      case ',':
-        --g_infrared_index;
-        if (g_infrared_index < 0) g_infrared_index = 0;
-        break;
-      case '<':
-        g_infrared_index -= 5;
-        if (g_infrared_index < 0) g_infrared_index = 0;
-        break;
-      default:
-        break;
-    }
-    if (index_old != g_infrared_index)
-      g_xp_sensor_ptr->set_infrared_param(g_infrared_mode, g_infrared_index, FLAGS_ir_period);
-  }
-  // By pressing "i" or "I", we circle around the following IR mode:
-  // OFF -> STRUCTURED -> INFRARED -> ALL_LIGHT -> OFF
-  if ((keypressed == 'i' || keypressed == 'I')) {
-    if (XP_sensor_type == SensorType::XPIRL2 || XP_sensor_type == SensorType::XPIRL3) {
-      if (g_infrared_mode == XPDRIVER::XP_SENSOR::OFF) {
-        g_infrared_mode = XPDRIVER::XP_SENSOR::STRUCTURED;
-        cv::namedWindow("img_lr_IR");
-        cv::moveWindow("img_lr_IR", 10, 10);
-      } else if (g_infrared_mode == XPDRIVER::XP_SENSOR::STRUCTURED) {
-        g_infrared_mode = XPDRIVER::XP_SENSOR::INFRARED;
-      } else if (g_infrared_mode == XPDRIVER::XP_SENSOR::INFRARED) {
-        g_infrared_mode = XPDRIVER::XP_SENSOR::ALL_LIGHT;
-      } else if (g_infrared_mode == XPDRIVER::XP_SENSOR::ALL_LIGHT) {
-        g_infrared_mode = XPDRIVER::XP_SENSOR::OFF;
-      } else {
-        g_infrared_mode = XPDRIVER::XP_SENSOR::OFF;
-      }
-      g_xp_sensor_ptr->set_infrared_param(g_infrared_mode, g_infrared_index, FLAGS_ir_period);
-      if (g_infrared_mode == XPDRIVER::XP_SENSOR::OFF) {
-        // close IR show window
-        cv::destroyWindow("img_lr_IR");
-      }
-    } else {
-      std::cout << "Only XPIRL2 support IR mode, Please check sensor type!"<< std::endl;
-    }
-  }
-  return true;
-}
-
-bool process_gain_control(char keypressed) {
-  if (g_xp_sensor_ptr == nullptr) {
-    return false;
-  }
-  using XPDRIVER::XP_SENSOR::kAEC_steps;
-  using XPDRIVER::XP_SENSOR::kAR0141_AEC_steps;
-  const bool is_ir_sensor = (XP_sensor_type == SensorType::XPIRL2 ||\
-                       XP_sensor_type == SensorType::XPIRL3);
-  uint32_t AEC_steps = (is_ir_sensor ? kAR0141_AEC_steps : kAEC_steps);
-  if (!g_auto_gain && keypressed != -1) {  // -1 means no key is pressed
-    switch (keypressed) {
-      case '1':
-        // The lowest brightness possible
-        g_aec_index = 0;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      case '2':
-        // 20% of max brightness
-        g_aec_index = AEC_steps * 0.2;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      case '3':
-        // 60% of max brightness
-        g_aec_index = AEC_steps * 0.6;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      case '4':
-        // max brightness
-        g_aec_index = AEC_steps - 1;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      case '+':
-      case '=':
-        ++g_aec_index;
-        if (g_aec_index >= AEC_steps) g_aec_index = AEC_steps - 1;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      case ']':
-        g_aec_index += 5;
-        if (g_aec_index >= AEC_steps) g_aec_index = AEC_steps - 1;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      case '-':
-        --g_aec_index;
-        if (g_aec_index < 0) g_aec_index = 0;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      case '[':
-        g_aec_index -= 5;
-        if (g_aec_index < 0) g_aec_index = 0;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      default:
-        break;
-    }
-  }
-  if (keypressed == 'a' || keypressed == 'A') {
-    g_auto_gain = !g_auto_gain;
-    g_xp_sensor_ptr->set_auto_gain(g_auto_gain);
-  }
   return true;
 }
 
@@ -598,12 +458,9 @@ int main(int argc, char** argv) {
   }
 #endif  // __ARM_NEON__
 
-  g_auto_gain = FLAGS_auto_gain;
   run_flag = true;
-  g_infrared_mode = XPDRIVER::XP_SENSOR::OFF;
-  g_infrared_index = 200;
   g_xp_sensor_ptr.reset(new XpSensorMultithread(FLAGS_sensor_type,
-                                                g_auto_gain,
+                                                FLAGS_auto_gain,
                                                 FLAGS_imu_from_image,
                                                 FLAGS_dev_name));
   // If input sensor_type is not supported, init will fail
@@ -692,9 +549,10 @@ int main(int argc, char** argv) {
 
   // Register callback functions and let XpSensorMultithread spin
   CHECK(g_xp_sensor_ptr);
-  g_xp_sensor_ptr->set_image_data_callback(image_data_callback);
+  g_xp_sensor_ptr->set_steady_image_callback(steady_image_data_callback);
   if (g_has_IR) {
-    g_xp_sensor_ptr->set_IR_data_callback(IR_data_callback);
+    g_xp_sensor_ptr->set_steady_IR_callback(steady_IR_data_callback);
+    g_xp_sensor_ptr->set_ir_period(FLAGS_ir_period);
   }
   g_xp_sensor_ptr->run();
 
@@ -705,7 +563,7 @@ int main(int argc, char** argv) {
 #endif
     {
       image_thread_safe_show(&g_img_lr_display);
-      if (g_has_IR && g_infrared_mode != XPDRIVER::XP_SENSOR::OFF) {
+      if (g_has_IR && g_xp_sensor_ptr->get_ir_on_status()) {
         image_thread_safe_show(&g_img_lr_IR_display);
       }
     }
@@ -721,11 +579,12 @@ int main(int argc, char** argv) {
       save_img = true;
       save_ir_img = true;
     } else if (keypressed != -1) {
-      if (!process_gain_control(keypressed)) {
-        LOG(ERROR) << "cannot process gain control";
-      }
-      if (!process_ir_control(keypressed)) {
-        LOG(ERROR) << "cannot process infrared control";
+      g_xp_sensor_ptr->set_key_control(keypressed);
+      if (g_xp_sensor_ptr->get_ir_on_status()) {
+        cv::namedWindow("img_lr_IR");
+        cv::moveWindow("img_lr_IR", 10, 10);
+      } else {
+        cv::destroyWindow("img_lr_IR");
       }
     }
   }

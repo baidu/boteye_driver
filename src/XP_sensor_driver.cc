@@ -17,6 +17,7 @@
 #include <driver/xp_sensors_wb_table.h>
 #include <driver/XP_sensor_driver.h>
 #include <driver/v4l2.h>
+#include <driver/XP_sensor.h>
 #include <driver/helper/timer.h>  // for profiling timer
 #include <driver/xp_aec_table.h>
 #include <driver/AR0141_aec_table.h>
@@ -73,6 +74,7 @@ XpSensorMultithread::XpSensorMultithread(const std::string& sensor_type_str,
     pull_imu_rate_ = 0;
     stream_images_rate_ = 0;
     stream_ir_images_rate_ = 0;
+    frame_counter_ = 0;
 }
 XpSensorMultithread::~XpSensorMultithread() {
   if (is_running_) {
@@ -110,6 +112,8 @@ bool XpSensorMultithread::init() {
       sensor_type_ = SensorType::XPIRL2;
     } else if (sensor_type_str_ == "XPIRL3") {
       sensor_type_ = SensorType::XPIRL3;
+    } else if (sensor_type_str_ == "XPIRL3_A") {
+      sensor_type_ = SensorType::XPIRL3_A;
     } else {
       XP_LOG_FATAL("Unsupported input sensor type: " << sensor_type_str_);
       return false;
@@ -129,6 +133,8 @@ bool XpSensorMultithread::init() {
     XP_SENSOR::xp_infrared_ctl(video_sensor_file_id_, XP_SENSOR::OFF , infrared_index_,
                                rgb_ir_period_);
     aec_index_ = 200;
+  } else if (sensor_type_ == SensorType::XPIRL3_A) {
+    aec_index_ = 200;
   } else if (sensor_type_ == SensorType::XP3) {
     aec_index_ =  150;
   } else {
@@ -143,7 +149,8 @@ bool XpSensorMultithread::init() {
   if (sensor_type_ == SensorType::XP3  ||
       sensor_type_ == SensorType::FACE ||
       sensor_type_ == SensorType::XPIRL3 ||
-      sensor_type_ == SensorType::XPIRL2) {
+      sensor_type_ == SensorType::XPIRL2 ||
+      sensor_type_ == SensorType::XPIRL3_A) {
     assert(wb_mode_str_.empty() != true);
     if (wb_mode_str_ == "auto") {
       whiteBalanceCorrector_.reset(new AutoWhiteBalance(false));
@@ -201,19 +208,37 @@ bool XpSensorMultithread::stop() {
   return true;
 }
 
-bool XpSensorMultithread::set_image_data_callback(
-    const XpSensorMultithread::ImageDataCallback& callback) {
+bool XpSensorMultithread::set_sys_image_callback(
+    const XpSensorMultithread::SysImageDataCallback& callback) {
   if (callback) {
-    image_data_callback_ = callback;
+    image_callback_with_sys_clock_ = callback;
     return true;
   }
   return false;
 }
 
-bool XpSensorMultithread::set_IR_data_callback(
-    const XpSensorMultithread::ImageDataCallback& callback) {
+bool XpSensorMultithread::set_steady_image_callback(
+    const XpSensorMultithread::SteadyImageDataCallback& callback) {
   if (callback) {
-    IR_data_callback_ = callback;
+    image_callback_with_steady_clock_ = callback;
+    return true;
+  }
+  return false;
+}
+
+bool XpSensorMultithread::set_sys_IR_callback(
+    const XpSensorMultithread::SysImageDataCallback& callback) {
+  if (callback) {
+    IR_callback_with_sys_clock_ = callback;
+    return true;
+  }
+  return false;
+}
+
+bool XpSensorMultithread::set_steady_IR_callback(
+    const XpSensorMultithread::SteadyImageDataCallback& callback) {
+  if (callback) {
+    IR_callback_with_steady_clock_ = callback;
     return true;
   }
   return false;
@@ -295,7 +320,8 @@ void XpSensorMultithread::convert_imu_axes(const XP_20608_data& imu_data,
     xp_imu.ang_v[2] =   imu_data.gyro[2] / 180.f * M_PI;
   } else if (sensor_type == SensorType::XPIRL ||
              sensor_type == SensorType::XPIRL2 ||
-             sensor_type == SensorType::XPIRL3) {
+             sensor_type == SensorType::XPIRL3 ||
+             sensor_type == SensorType::XPIRL3_A) {
     xp_imu.accel[0] = - imu_data.accel[0];
     xp_imu.accel[1] =   imu_data.accel[1];
     xp_imu.accel[2] = - imu_data.accel[2];
@@ -377,7 +403,6 @@ void XpSensorMultithread::thread_stream_images() {
   // TODO(mingyu): Put back thread param control
   XP_VLOG(1, "======== start thread_stream_images thread");
   Counter32To64 counter32To64_img(XP_CLOCK_32BIT_MAX_COUNT);
-  int frame_counter = 0;
   uint64_t last_img_count_wo_overflow_debug = 0;
   XPDRIVER::XP_SENSOR::ImuReader imu_reader;  // read IMU encoded in img
 
@@ -407,19 +432,19 @@ void XpSensorMultithread::thread_stream_images() {
       break;
     }
     uint8_t* img_data_ptr = raw_ptr_n_sys_time.first;
-    ++frame_counter;
+    ++frame_counter_;
 #ifdef __ARM_NEON__
     // since arm platform is buggy, signal the user that at least
     // 1 image is received.
     // TODO(mingyu): Does this problem still persist in our current sensor?
-    if (frame_counter == 1) {
+    if (frame_counter_ == 1) {
       XP_LOG_INFO("Receiving imgs" << std::endl);
     }
 #endif
     // The first few imgs contain garbage data
-    if (frame_counter == 1) {
+    if (frame_counter_ == 1) {
       continue;
-    } else if (frame_counter > 1) {
+    } else if (frame_counter_ > 1) {
       // Only check the left image tag starting from row = 6 to avoid checking on embedded imu data
       bool frame_incomplete = false;
       for (int i = 6; i < XP_sensor_spec_.RowNum; i++) {
@@ -430,15 +455,15 @@ void XpSensorMultithread::thread_stream_images() {
       }
       if (frame_incomplete) {
         image_imcomplete_cout++;
-        XP_LOG_ERROR("Warning: frame :" << frame_counter << " detect imcomplete image");
+        XP_LOG_ERROR("Warning: frame :" << frame_counter_ << " detect imcomplete image");
         continue;
       }
     }
-    if (frame_counter < IMAGE_COMPLETE_CHECK_NUM && image_imcomplete_cout >= 2) {
+    if (frame_counter_ < IMAGE_COMPLETE_CHECK_NUM && image_imcomplete_cout >= 2) {
       imu_from_image_ = true;
       XP_LOG_ERROR("Warniing: auto-swithc to imu from image moe");
       // skip 2 image after auto switcn imu_from_image mode
-      if (frame_counter < IMAGE_COMPLETE_CHECK_NUM + 2)
+      if (frame_counter_ < IMAGE_COMPLETE_CHECK_NUM + 2)
         continue;
     }
     // get and check image timestamp
@@ -449,6 +474,7 @@ void XpSensorMultithread::thread_stream_images() {
         sensor_type_ == SensorType::XPIRL ||
         sensor_type_ == SensorType::XPIRL2 ||
         sensor_type_ == SensorType::XPIRL3 ||
+        sensor_type_ == SensorType::XPIRL3_A ||
         sensor_type_ == SensorType::FACE) {
       clock_count_with_overflow = XP_SENSOR::get_timestamp_in_img(img_data_ptr + imu_data_pos);
     } else {
@@ -546,13 +572,14 @@ void XpSensorMultithread::thread_stream_images() {
     get_images_from_raw_data(img_data_ptr, &img_l, &img_r, &img_l_IR, &img_r_IR);
     if (img_l.rows != 0 && img_r.rows != 0) {
       // Control brightness with user input aec_index or aec (adjust every 5 frames)
-      if (use_auto_gain_ && frame_counter % 5 == 3) {
+      if (use_auto_gain_ && frame_counter_ % 5 == 3) {
         int new_aec_index = aec_index_;
         using XPDRIVER::XP_SENSOR::kAEC_steps;
         using XPDRIVER::XP_SENSOR::kAR0141_AEC_steps;
         // [NOTE] Color image is converted to gray inside computeNewAecTableIndex
         bool is_ar0141_sensor = (sensor_type_ == SensorType::XPIRL2 || \
-                                 sensor_type_ == SensorType::XPIRL3);
+                                 sensor_type_ == SensorType::XPIRL3 || \
+                                 sensor_type_ == SensorType::XPIRL3_A);
         if (XPDRIVER::computeNewAecTableIndex(img_l, aec_settle_,
             is_ar0141_sensor ? kAR0141_AEC_steps : kAEC_steps, &new_aec_index)) {
           if (new_aec_index != aec_index_) {
@@ -595,16 +622,24 @@ void XpSensorMultithread::thread_stream_images() {
       // so that we can have IMU measurements queued up before the first image.
       if (img_time_sec <  0.05) continue;
 
-      if (image_data_callback_ != nullptr) {
-        image_data_callback_(img_l, img_r, time_100us, raw_ptr_n_sys_time.second);
+      if (image_callback_with_steady_clock_ != nullptr) {
+        image_callback_with_steady_clock_(img_l, img_r, time_100us, raw_ptr_n_sys_time.second);
+      }
+      if (image_callback_with_sys_clock_ != nullptr) {
+        // TODO(zhoury): add system clock on ioctl
+        image_callback_with_sys_clock_(img_l, img_r, time_100us, std::chrono::system_clock::now());
       }
       ++stream_images_count_;
     }
     if (img_l_IR.rows != 0 && img_r_IR.rows != 0) {
       bool is_ir_sensor = (sensor_type_ == SensorType::XPIRL2 ||\
                            sensor_type_ == SensorType::XPIRL3);
-      if (IR_data_callback_ != nullptr && is_ir_sensor) {
-        IR_data_callback_(img_l_IR, img_r_IR, time_100us, raw_ptr_n_sys_time.second);
+      if (IR_callback_with_steady_clock_ != nullptr && is_ir_sensor) {
+        IR_callback_with_steady_clock_(img_l_IR, img_r_IR, time_100us, raw_ptr_n_sys_time.second);
+      }
+      if (IR_callback_with_sys_clock_ != nullptr && is_ir_sensor) {
+        // TODO(zhoury): add system clock on ioctl
+        IR_callback_with_sys_clock_(img_l_IR, img_r_IR, time_100us, std::chrono::system_clock::now());
       }
       ++stream_ir_images_count_;
     }
@@ -775,7 +810,7 @@ bool XpSensorMultithread::set_infrared_param(const XP_SENSOR::infrared_mode_t IR
 
   if (IR_mode == XP_SENSOR::OFF) {
     // set rgb_ir_period zero to close all IR light
-    rgb_ir_period_ = 0;
+    // rgb_ir_period_ = 0;
   }
   ir_ctl_updated_ = true;
 
@@ -816,6 +851,7 @@ bool XpSensorMultithread::is_color() const {
   return (sensor_type_ == SensorType::XP3 ||
           sensor_type_ == SensorType::XPIRL2 ||
           sensor_type_ == SensorType::XPIRL3 ||
+          sensor_type_ == SensorType::XPIRL3_A ||
           sensor_type_ == SensorType::FACE);
 }
 
@@ -835,8 +871,8 @@ bool XpSensorMultithread::get_v024_img_from_raw_data(const uint8_t* img_data_ptr
   return true;
 }
 
-// handle XP3 FACE color sensor image from raw data
-bool XpSensorMultithread::get_v034_img_from_raw_data(const uint8_t* img_data_ptr,
+// handle XP3 FACE XPIRL3_A color sensor image from raw data
+bool XpSensorMultithread::get_color_img_from_raw_data(const uint8_t* img_data_ptr,
                                                      cv::Mat* img_l_ptr,
                                                      cv::Mat* img_r_ptr) {
   XP_CHECK_NOTNULL(img_data_ptr);
@@ -855,8 +891,13 @@ bool XpSensorMultithread::get_v034_img_from_raw_data(const uint8_t* img_data_ptr
   }
   cv::Mat img_l_color(row_num, col_num, CV_8UC3);
   cv::Mat img_r_color(row_num, col_num, CV_8UC3);
-  cv::cvtColor(img_l_mono, img_l_color, cv::COLOR_BayerGR2BGR);
-  cv::cvtColor(img_r_mono, img_r_color, cv::COLOR_BayerGR2BGR);
+  if (sensor_type_ == SensorType::XPIRL3_A) {
+    cv::cvtColor(img_l_mono, img_l_color, cv::COLOR_BayerGB2BGR);
+    cv::cvtColor(img_r_mono, img_r_color, cv::COLOR_BayerGB2BGR);
+  } else {
+    cv::cvtColor(img_l_mono, img_l_color, cv::COLOR_BayerGR2BGR);
+    cv::cvtColor(img_r_mono, img_r_color, cv::COLOR_BayerGR2BGR);
+  }
   if (whiteBalanceCorrector_) {
     whiteBalanceCorrector_->run(&img_l_color);
     whiteBalanceCorrector_->run(&img_r_color);
@@ -1270,7 +1311,8 @@ bool XpSensorMultithread::get_images_from_raw_data(const uint8_t* img_data_ptr,
       break;
     case SensorType::XP3:
     case SensorType::FACE:
-      if (!get_v034_img_from_raw_data(img_data_ptr, img_l_ptr, img_r_ptr)) {
+    case SensorType::XPIRL3_A:
+      if (!get_color_img_from_raw_data(img_data_ptr, img_l_ptr, img_r_ptr)) {
         XP_LOG_ERROR("get v034 image from raw data fail");
         return_value = false;
       }
@@ -1488,5 +1530,185 @@ void XpSensorMultithread::handle_col_shift_case(uint8_t* img_data_ptr, int col_s
     }
   }
 }
+
+bool XpSensorMultithread::get_calib_from_sensor(std::string *calib_str) {
+  if (XP_SENSOR::read_calib_str_from_device(video_sensor_file_id_, calib_str)) {
+    return true;
+  }
+  *calib_str = "";
+  return false;
+}
+
+bool XpSensorMultithread::store_calib_to_sensor(const std::string& calib_str) {
+  XP_SENSOR::write_calib_str_to_device(video_sensor_file_id_, calib_str);
+  return true;
+}
+
+bool XpSensorMultithread::set_ir_period(const int ir_period) {
+  rgb_ir_period_ = ir_period;
+  return true;
+}
+// TODO(zhoury): modify keypressed to enum
+bool XpSensorMultithread::set_key_control(const char keypressed) {
+  if (!is_running_) {
+    XP_LOG_ERROR("XP sensor if not running");
+    return false;
+  }
+  if (!process_gain_control(keypressed)) {
+    XP_LOG_ERROR("XP driver cannot process gain control");
+  }
+  if (!process_ir_control(keypressed)) {
+    XP_LOG_ERROR("XP driver cannot process infrared control");
+  }
+  return true;
+}
+
+inline bool XpSensorMultithread::process_ir_control(char keypressed) {
+// -1 means no key is pressed
+  using XP_SENSOR::infrared_pwm_max;
+  if (ir_mode_ != XPDRIVER::XP_SENSOR::OFF && keypressed != -1) {
+    int new_infrared_index = infrared_index_;
+    switch (keypressed) {
+      case '6':
+        new_infrared_index = 1;
+        break;
+      case '7':
+        new_infrared_index = infrared_pwm_max * 0.2;
+        break;
+      case '8':
+        new_infrared_index = infrared_pwm_max * 0.6;
+        break;
+      case '9':
+        new_infrared_index = infrared_pwm_max - 10;
+        break;
+      case '.':
+        ++new_infrared_index;
+        if (new_infrared_index >= infrared_pwm_max) new_infrared_index = infrared_pwm_max -1;
+        break;
+      case '>':
+        new_infrared_index += 5;
+        if (new_infrared_index >= infrared_pwm_max) new_infrared_index = infrared_pwm_max -1;
+        break;
+      case ',':
+        --new_infrared_index;
+        if (new_infrared_index < 0) new_infrared_index = 0;
+        break;
+      case '<':
+        new_infrared_index -= 5;
+        if (new_infrared_index < 0) new_infrared_index = 0;
+        break;
+      default:
+        break;
+    }
+    if (infrared_index_ != new_infrared_index)
+      set_infrared_param(ir_mode_, new_infrared_index, rgb_ir_period_);
+  }
+  // By pressing "i" or "I", we circle around the following IR mode:
+  // OFF -> STRUCTURED -> INFRARED -> ALL_LIGHT -> OFF
+  if ((keypressed == 'i' || keypressed == 'I')) {
+    if (sensor_type_ == SensorType::XPIRL2 || sensor_type_ == SensorType::XPIRL3) {
+      XP_SENSOR::infrared_mode_t new_ir_mode = ir_mode_;
+      if (new_ir_mode == XP_SENSOR::OFF) {
+        new_ir_mode = XP_SENSOR::STRUCTURED;
+      } else if (new_ir_mode == XP_SENSOR::STRUCTURED) {
+        new_ir_mode = XP_SENSOR::INFRARED;
+      } else if (new_ir_mode == XP_SENSOR::INFRARED) {
+        new_ir_mode = XP_SENSOR::ALL_LIGHT;
+      } else if (new_ir_mode == XP_SENSOR::ALL_LIGHT) {
+        new_ir_mode = XP_SENSOR::OFF;
+      } else {
+        new_ir_mode = XP_SENSOR::OFF;
+      }
+      set_infrared_param(new_ir_mode, infrared_index_, rgb_ir_period_);
+    } else {
+      XP_LOG_ERROR("Only XPIRL2/3 support IR mode, Please check sensor type!");
+    }
+  }
+  return true;
+}
+
+inline bool XpSensorMultithread::process_gain_control(char keypressed) {
+  using XP_SENSOR::kAEC_steps;
+  using XP_SENSOR::kAR0141_AEC_steps;
+  const bool is_ir_sensor = (sensor_type_ == SensorType::XPIRL2 ||\
+                       sensor_type_ == SensorType::XPIRL3);
+  uint32_t AEC_steps = (is_ir_sensor ? kAR0141_AEC_steps : kAEC_steps);
+  if (!use_auto_gain_ && keypressed != -1) {  // -1 means no key is pressed
+    int new_aec_index = aec_index_;
+    switch (keypressed) {
+      case '1':
+        // The lowest brightness possible
+        new_aec_index = 0;
+        set_aec_index(new_aec_index);
+        break;
+      case '2':
+        // 20% of max brightness
+        new_aec_index = AEC_steps * 0.2;
+        set_aec_index(new_aec_index);
+        break;
+      case '3':
+        // 60% of max brightness
+        new_aec_index = AEC_steps * 0.6;
+        set_aec_index(new_aec_index);
+        break;
+      case '4':
+        // max brightness
+        new_aec_index = AEC_steps - 1;
+        set_aec_index(new_aec_index);
+        break;
+      case '+':
+      case '=':
+        ++new_aec_index;
+        if (new_aec_index >= AEC_steps) new_aec_index = AEC_steps - 1;
+        set_aec_index(new_aec_index);
+        break;
+      case ']':
+        new_aec_index += 5;
+        if (new_aec_index >= AEC_steps) new_aec_index = AEC_steps - 1;
+        set_aec_index(new_aec_index);
+        break;
+      case '-':
+        --new_aec_index;
+        if (new_aec_index < 0) new_aec_index = 0;
+        set_aec_index(new_aec_index);
+        break;
+      case '[':
+        new_aec_index -= 5;
+        if (new_aec_index < 0) new_aec_index = 0;
+        set_aec_index(new_aec_index);
+        break;
+      default:
+        break;
+    }
+  }
+  if (keypressed == 'a' || keypressed == 'A') {
+    bool new_auto_gain = !use_auto_gain_;
+    set_auto_gain(new_auto_gain);
+  }
+  return true;
+}
+
+bool XpSensorMultithread::get_ir_on_status(void) {
+  return !(ir_mode_ == XP_SENSOR::OFF);
+}
+
+bool XpSensorMultithread::set_awb_mode(bool AutoMode,
+                                       float coeff_r,
+                                       float coeff_g,
+                                       float coeff_b) {
+  if (whiteBalanceCorrector_ != nullptr) {
+    if (AutoMode) {
+      whiteBalanceCorrector_->setAutoWhiteBalanceMode();
+    } else if (coeff_r == 0 && coeff_g == 0 && coeff_b == 0) {
+      whiteBalanceCorrector_->setWhiteBalancePresetMode();
+    } else {
+      whiteBalanceCorrector_->setWhiteBalancePresetMode(coeff_r, coeff_g, coeff_b);
+    }
+    return true;
+  } else {
+    return false;
+  }
+}
+
 #endif  // __linux__
 }  // namespace XPDRIVER

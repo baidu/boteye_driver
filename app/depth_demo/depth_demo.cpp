@@ -17,9 +17,8 @@
 #define _GNU_SOURCE
 #endif
 #include <glog/logging.h>
+#include <gflags/gflags.h>
 #include <driver/helper/shared_queue.h>
-#include <driver/xp_aec_table.h>
-#include <driver/AR0141_aec_table.h>
 #include <driver/XP_sensor_driver.h>
 #include <XP/helper/param.h>
 #include <XP/depth/depth_utils.h>
@@ -50,11 +49,10 @@ DEFINE_bool(auto_gain, false, "turn on auto gain");
 DEFINE_string(wb_mode, "preset", "white balance mode: auto, disabled, preset");
 DEFINE_string(dev_name, "", "which video dev name to open. Empty enables auto mode");
 DEFINE_string(calib_yaml, "", "load calib file");
-DEFINE_string(ir_calib_yaml, "", "load IR calib file");
 DEFINE_string(depth_param_yaml, "", "load depth config file");
 DEFINE_bool(depth, false, "whether or not show depth image");
 DEFINE_bool(ir_depth, false, "whether or not show ir depth image");
-DEFINE_string(sensor_type, "", "XP or XP2 or XP3 or FACE or XPIRL or XPIRL2, XPIRL3");
+DEFINE_string(sensor_type, "", "XP or XP2 or XP3 or FACE or XPIRL or XPIRL2 or XPIRL3, XPIRL3_A");
 DEFINE_bool(spacebar_mode, false, "only save img when press space bar");
 DEFINE_string(record_path, "", "path to save images. Set empty to disable saving");
 DEFINE_int32(ir_period, 2, "One IR image in every ir_period frames. 0: all RGBs, 1: all IRs,"
@@ -93,17 +91,15 @@ XPDRIVER::shared_queue<StereoImage> IR_depth_queue("IR_depth_queue");
 XPDRIVER::shared_queue<StereoImage> stereo_image_queue("stereo_image_queue");
 XPDRIVER::shared_queue<StereoImage> IR_image_queue("IR_image_queue");
 std::atomic<bool> run_flag;
-std::atomic<bool> save_img, save_ir_img;
+std::atomic<bool> g_save_img, g_save_ir_img;
 SensorType XP_sensor_type;
 // we use the first imu to approx img time based on img counter
-std::atomic<bool> g_auto_gain;
-XPDRIVER::XP_SENSOR::infrared_mode_t g_infrared_mode;
-int g_aec_index;  // signed int as the index may go to negative while calculation
-int g_infrared_index;
 cv::Size g_img_size;
 ImgForShow g_img_lr_display, g_img_lr_IR_display;
 ImgForShow g_depth_canvas;
 bool g_has_IR;
+bool g_use_sensor_calib = false;
+std::string g_calib_str;
 
 // The unique instance of XpSensorMultithread
 std::unique_ptr<XPDRIVER::XpSensorMultithread> g_xp_sensor_ptr;
@@ -144,8 +140,8 @@ bool create_directory(const std::string dir_name) {
 
 // Callback functions for XpSensorMultithread
 // [NOTE] These callback functions have to be light-weight as it *WILL* block XpSensorMultithread
-void image_data_callback(const cv::Mat& img_l, const cv::Mat& img_r, const float ts_100us,
-                         const std::chrono::time_point<std::chrono::steady_clock>& sys_time) {
+void steady_image_data_callback(const cv::Mat& img_l, const cv::Mat& img_r, const float ts_100us,
+                                const std::chrono::time_point<std::chrono::steady_clock>& steady_time) {
   if (run_flag) {
     StereoImage stereo_img;
     stereo_img.l = img_l;
@@ -155,8 +151,8 @@ void image_data_callback(const cv::Mat& img_l, const cv::Mat& img_r, const float
   }
 }
 
-void IR_data_callback(const cv::Mat& img_l, const cv::Mat& img_r, const float ts_100us,
-                      const std::chrono::time_point<std::chrono::steady_clock>& sys_time) {
+void steady_IR_data_callback(const cv::Mat& img_l, const cv::Mat& img_r, const float ts_100us,
+                             const std::chrono::time_point<std::chrono::steady_clock>& sys_time) {
   if (run_flag) {
     StereoImage IR_img;
     IR_img.l = img_l;
@@ -272,141 +268,6 @@ bool kill_all_shared_queues() {
   return true;
 }
 
-bool process_ir_control(char keypressed) {
-  if (g_xp_sensor_ptr == nullptr) {
-    return false;
-  }
-  using XPDRIVER::XP_SENSOR::infrared_pwm_max;
-  // -1 means no key is pressed
-  if (g_infrared_mode != XPDRIVER::XP_SENSOR::OFF && keypressed != -1) {
-    int index_old = g_infrared_index;
-    switch (keypressed) {
-      case '6':
-        g_infrared_index = 1;
-        break;
-      case '7':
-        g_infrared_index = infrared_pwm_max * 0.2;
-        break;
-      case '8':
-        g_infrared_index = infrared_pwm_max * 0.6;
-        break;
-      case '9':
-        g_infrared_index = infrared_pwm_max - 10;
-        break;
-      case '.':
-        ++g_infrared_index;
-        if (g_infrared_index >= infrared_pwm_max) g_infrared_index = infrared_pwm_max -1;
-        break;
-      case '>':
-        g_infrared_index += 5;
-        if (g_infrared_index >= infrared_pwm_max) g_infrared_index = infrared_pwm_max -1;
-        break;
-      case ',':
-        --g_infrared_index;
-        if (g_infrared_index < 0) g_infrared_index = 0;
-        break;
-      case '<':
-        g_infrared_index -= 5;
-        if (g_infrared_index < 0) g_infrared_index = 0;
-        break;
-      default:
-        break;
-    }
-    if (index_old != g_infrared_index)
-      g_xp_sensor_ptr->set_infrared_param(g_infrared_mode, g_infrared_index, FLAGS_ir_period);
-  }
-  // By pressing "i" or "I", we circle around the following IR mode:
-  // OFF -> STRUCTURED -> INFRARED -> ALL_LIGHT -> OFF
-  if ((keypressed == 'i' || keypressed == 'I')) {
-    if (XP_sensor_type == SensorType::XPIRL2 || XP_sensor_type == SensorType::XPIRL3) {
-      if (g_infrared_mode == XPDRIVER::XP_SENSOR::OFF) {
-        g_infrared_mode = XPDRIVER::XP_SENSOR::STRUCTURED;
-        cv::namedWindow("img_lr_IR");
-        cv::moveWindow("img_lr_IR", 10, 10);
-      } else if (g_infrared_mode == XPDRIVER::XP_SENSOR::STRUCTURED) {
-        g_infrared_mode = XPDRIVER::XP_SENSOR::INFRARED;
-      } else if (g_infrared_mode == XPDRIVER::XP_SENSOR::INFRARED) {
-        g_infrared_mode = XPDRIVER::XP_SENSOR::ALL_LIGHT;
-      } else if (g_infrared_mode == XPDRIVER::XP_SENSOR::ALL_LIGHT) {
-        g_infrared_mode = XPDRIVER::XP_SENSOR::OFF;
-      } else {
-        g_infrared_mode = XPDRIVER::XP_SENSOR::OFF;
-      }
-      g_xp_sensor_ptr->set_infrared_param(g_infrared_mode, g_infrared_index, FLAGS_ir_period);
-      if (g_infrared_mode == XPDRIVER::XP_SENSOR::OFF) {
-        // close IR show window
-        cv::destroyWindow("img_lr_IR");
-      }
-    } else {
-      std::cout << "Only XPIRL2 support IR mode, Please check sensor type!"<< std::endl;
-    }
-  }
-  return true;
-}
-
-bool process_gain_control(char keypressed) {
-  if (g_xp_sensor_ptr == nullptr) {
-    return false;
-  }
-  using XPDRIVER::XP_SENSOR::kAEC_steps;
-  using XPDRIVER::XP_SENSOR::kAR0141_AEC_steps;
-  const bool is_ir_sensor = (XP_sensor_type == SensorType::XPIRL2 ||\
-                       XP_sensor_type == SensorType::XPIRL3);
-  uint32_t AEC_steps = (is_ir_sensor ? kAR0141_AEC_steps : kAEC_steps);
-  if (!g_auto_gain && keypressed != -1) {  // -1 means no key is pressed
-    switch (keypressed) {
-      case '1':
-        // The lowest brightness possible
-        g_aec_index = 0;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      case '2':
-        // 20% of max brightness
-        g_aec_index = AEC_steps * 0.2;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      case '3':
-        // 60% of max brightness
-        g_aec_index = AEC_steps * 0.6;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      case '4':
-        // max brightness
-        g_aec_index = AEC_steps - 1;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      case '+':
-      case '=':
-        ++g_aec_index;
-        if (g_aec_index >= AEC_steps) g_aec_index = AEC_steps - 1;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      case ']':
-        g_aec_index += 5;
-        if (g_aec_index >= AEC_steps) g_aec_index = AEC_steps - 1;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      case '-':
-        --g_aec_index;
-        if (g_aec_index < 0) g_aec_index = 0;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      case '[':
-        g_aec_index -= 5;
-        if (g_aec_index < 0) g_aec_index = 0;
-        g_xp_sensor_ptr->set_aec_index(g_aec_index);
-        break;
-      default:
-        break;
-    }
-  }
-  if (keypressed == 'a' || keypressed == 'A') {
-    g_auto_gain = !g_auto_gain;
-    g_xp_sensor_ptr->set_auto_gain(g_auto_gain);
-  }
-  return true;
-}
-
 // Threads
 void thread_proc_img() {
   VLOG(1) << "========= thread_proc_img thread starts";
@@ -418,25 +279,28 @@ void thread_proc_img() {
 
   const bool is_color = g_xp_sensor_ptr->is_color();
   XP::DuoCalibParam calib_param;
-  if (!FLAGS_calib_yaml.empty()) {
-    if (!calib_param.LoadCamCalibFromYaml(FLAGS_calib_yaml)) {
-      LOG(ERROR) << FLAGS_calib_yaml << " cannot be loaded";
-      run_flag = false;
-      return;
-    }
-    if (g_img_size != calib_param.Camera.img_size) {
-      LOG(ERROR) << "g_img_size = " << g_img_size
-                 << " != calib info" << calib_param.Camera.img_size;
-      run_flag = false;
-      return;
-    }
-  }
   XP::DuoCalibParam ir_calib_param;
-  if (FLAGS_ir_depth && !FLAGS_ir_calib_yaml.empty()) {
-    if (!ir_calib_param.LoadCamCalibFromYaml(FLAGS_ir_calib_yaml)) {
-      LOG(ERROR) << FLAGS_ir_calib_yaml << " cannot be loaded";
-      run_flag = false;
-      return;
+  if (g_use_sensor_calib) {
+    // load calib from string
+    calib_param.LoadFromString(g_calib_str);
+    ir_calib_param = calib_param;
+    ir_calib_param.ConvertToHalfScale();
+  } else {
+    // load calib from file
+    if (!FLAGS_calib_yaml.empty()) {
+      if (!calib_param.LoadCamCalibFromYaml(FLAGS_calib_yaml)) {
+        LOG(ERROR) << FLAGS_calib_yaml << " cannot be loaded";
+        run_flag = false;
+        return;
+      }
+      if (g_img_size != calib_param.Camera.img_size) {
+        LOG(ERROR) << "g_img_size = " << g_img_size
+                  << " != calib info" << calib_param.Camera.img_size;
+        run_flag = false;
+        return;
+      }
+      ir_calib_param = calib_param;
+      ir_calib_param.ConvertToHalfScale();
     }
   }
 
@@ -449,6 +313,10 @@ void thread_proc_img() {
   size_t frame_counter = 0;
   std::chrono::time_point<steady_clock> pre_proc_time = steady_clock::now();
   float thread_proc_img_rate = 0.f;
+  // Using global g_save_img directly will cause crash because some Mat
+  // would be cloned but it is empty, local variable can solve this problem.
+  // Only if save_img == true can we save images
+  bool save_img = false;
   while (run_flag) {
     VLOG(1) << "========= thread_proc_img loop starts";
     // check if the imgs queue is too long
@@ -486,8 +354,11 @@ void thread_proc_img() {
     }
     if (!FLAGS_spacebar_mode && !FLAGS_record_path.empty()) {
       // always true
-      save_img = true;
+      g_save_img = true;
     }
+    // Cache the global g_save_img to ensure the save flag is
+    // consistent within this iteration.
+    save_img = g_save_img;
     // Get the mono/color image Mats properly
     // Sanity check first
     if (is_color) {
@@ -517,7 +388,7 @@ void thread_proc_img() {
       // [NOTE]:Only when camera puts IR images can we wait for the IR_depth_queue,
       // or sensor would not stop putting RGB images into stereo_image_queue which would
       // casue memory explosion.
-      if (g_infrared_mode != XPDRIVER::XP_SENSOR::OFF) {
+      if (g_xp_sensor_ptr->get_ir_on_status()) {
         StereoImage IR_latest_img;
         // Pop latest IR image for depth process
         if (!IR_depth_queue.wait_and_pop_to_back(&IR_latest_img)) {
@@ -537,7 +408,7 @@ void thread_proc_img() {
     }
     if (FLAGS_ir_depth) {
       // [NOTE]:There is no need to compute ir depth image if no new ir images received.
-      if (g_infrared_mode != XPDRIVER::XP_SENSOR::OFF) {
+      if (g_xp_sensor_ptr->get_ir_on_status()) {
         process_stereo_ir_depth(calib_param,
                                 ir_calib_param,
                                 img_l_ir,
@@ -574,7 +445,7 @@ void thread_proc_img() {
           img_for_save.xyz = g_depth_xyz_img.clone();
       }
       imgs_for_saving_queue.push_back(img_for_save);
-      save_img = false;  // reset
+      g_save_img = false;  // reset
     }
     ++frame_counter;
     VLOG(1) << "========= thread_proc_img loop ends";
@@ -596,6 +467,7 @@ void thread_proc_ir_img() {
   size_t frame_counter = 0;
   std::chrono::time_point<steady_clock> pre_proc_time = steady_clock::now();
   float thread_proc_img_rate = 0.f;
+  bool save_ir_img = false;
   while (run_flag) {
     VLOG(1) << "========= thread_proc_img loop starts";
     // check if the ir imgs queue is too long
@@ -630,8 +502,11 @@ void thread_proc_ir_img() {
 
     if (!FLAGS_spacebar_mode && !FLAGS_record_path.empty()) {
       // always true
-      save_ir_img = true;
+      g_save_ir_img = true;
     }
+    // Cache the global g_save_ir_img to ensure the save flag is
+    // consistent within this iteration.
+    save_ir_img = g_save_ir_img;
 
     // show some debug info
     // TODO(zhourenyi): Implement get_ir_image_rate
@@ -655,7 +530,7 @@ void thread_proc_ir_img() {
       IR_img_for_save.l = IR_img.l.clone();
       IR_img_for_save.r = IR_img.r.clone();
       IR_imgs_for_saving_queue.push_back(IR_img_for_save);
-      save_ir_img = false;  // reset
+      g_save_ir_img = false;  // reset
     }
     ++frame_counter;
     usleep(1000);  // sleep for 1ms
@@ -665,7 +540,7 @@ void thread_proc_ir_img() {
 }
 
 void thread_save_img() {
-  save_img = false;  // reset
+  g_save_img = false;  // reset
   if (FLAGS_record_path.empty()) {
     return;
   }
@@ -699,7 +574,7 @@ void thread_save_img() {
 
 void thread_save_ir_img() {
   VLOG(1) << "========= thread_save_ir_img thread starts";
-  save_ir_img = false;  // reset
+  g_save_ir_img = false;  // reset
   if (FLAGS_record_path.empty()) {
     return;
   }
@@ -730,29 +605,9 @@ int main(int argc, char** argv) {
     std::cout << "RUN ON CORE [" << FLAGS_cpu_core << "]" << std::endl;
   }
 #endif  // __ARM_NEON__
-  if (FLAGS_calib_yaml.empty()) {
-    // some mode requires FLAGS_calib_yaml
-    if (FLAGS_depth) {
-      LOG(ERROR) << "You must set calib_yaml to enable undistort";
-      return -1;
-    }
-  }
-  int is_ir_depth_mode = 0;
-  if (FLAGS_ir_depth && (FLAGS_ir_calib_yaml.empty() || FLAGS_calib_yaml.empty() ||
-      FLAGS_depth_param_yaml.empty())) {
-    LOG(ERROR) << "You must set ir_calib_yaml, calib_yaml and depth_param_yaml to enable ir_depth";
-    return -1;
-  } else if (FLAGS_ir_depth) {
-    // Auto open IR infrared light in ir_depth.
-    is_ir_depth_mode = 1;
-  }
-
-  g_auto_gain = FLAGS_auto_gain;
   run_flag = true;
-  g_infrared_mode = XPDRIVER::XP_SENSOR::OFF;
-  g_infrared_index = 200;
   g_xp_sensor_ptr.reset(new XpSensorMultithread(FLAGS_sensor_type,
-                                                g_auto_gain,
+                                                FLAGS_auto_gain,
                                                 true,
                                                 FLAGS_dev_name,
                                                 FLAGS_wb_mode));
@@ -762,6 +617,44 @@ int main(int argc, char** argv) {
   } else {
     LOG(ERROR) << "XpSensorMultithread failed to init";
     return -1;
+  }
+  if (FLAGS_calib_yaml.empty()) {
+    if (FLAGS_depth || FLAGS_ir_depth) {
+      std::cout << "Loading calib file from sensor..." << std::endl;
+      if (g_xp_sensor_ptr->get_calib_from_sensor(&g_calib_str)) {
+        g_use_sensor_calib = true;
+      } else {
+        // some mode requires FLAGS_calib_yaml
+        if (FLAGS_depth) {
+          LOG(ERROR) << "You must set calib_yaml to enable undistort";
+          return -1;
+        }
+      }
+    }
+  }
+  int is_ir_depth_mode = 0;
+  if (FLAGS_ir_depth) {
+    if (g_use_sensor_calib) {
+      if (g_calib_str.empty()) {
+        LOG(ERROR) << "Cannot find calib file in sensor";
+        return -1;
+      }
+      if (FLAGS_depth_param_yaml.empty()) {
+        LOG(ERROR) << "You must set depth_param_yaml when using calib files directly"
+                   << "from sensor to enable ir_depth";
+        return -1;
+      } else {
+        is_ir_depth_mode = 1;
+      }
+    } else {
+      if (FLAGS_calib_yaml.empty() || FLAGS_depth_param_yaml.empty()) {
+        LOG(ERROR) << "You must set calib_yaml and depth_param_yaml"
+                   << "to enable ir_depth";
+        return -1;
+      } else {
+        is_ir_depth_mode = 1;
+      }
+    }
   }
   // check sensor_type after driver match
   g_xp_sensor_ptr->get_sensor_type(&XP_sensor_type);
@@ -848,15 +741,16 @@ int main(int argc, char** argv) {
 
   // Register callback functions and let XpSensorMultithread spin
   CHECK(g_xp_sensor_ptr);
-  g_xp_sensor_ptr->set_image_data_callback(image_data_callback);
+  g_xp_sensor_ptr->set_steady_image_callback(steady_image_data_callback);
   if (g_has_IR) {
-    g_xp_sensor_ptr->set_IR_data_callback(IR_data_callback);
+    g_xp_sensor_ptr->set_steady_IR_callback(steady_IR_data_callback);
+    g_xp_sensor_ptr->set_ir_period(FLAGS_ir_period);
   }
   g_xp_sensor_ptr->run();
 
   size_t frame_counter = 0;
   if (is_ir_depth_mode) {
-    if (!process_ir_control('I')) {
+    if (!g_xp_sensor_ptr->set_key_control('I')) {
         LOG(ERROR) << "cannot process infrared control";
       }
   }
@@ -867,10 +761,10 @@ int main(int argc, char** argv) {
 #endif
     {
       image_thread_safe_show(&g_img_lr_display);
-      if (g_has_IR && g_infrared_mode != XPDRIVER::XP_SENSOR::OFF) {
+      if (g_has_IR && g_xp_sensor_ptr->get_ir_on_status()) {
         image_thread_safe_show(&g_img_lr_IR_display);
       }
-      if (FLAGS_depth || FLAGS_ir_depth) {
+      if (FLAGS_depth || (FLAGS_ir_depth && g_xp_sensor_ptr->get_ir_on_status())) {
         image_thread_safe_show(&g_depth_canvas);
       }
     }
@@ -882,14 +776,22 @@ int main(int argc, char** argv) {
       break;
     } else if (keypressed == 32 && !FLAGS_record_path.empty()) {
       // space
-      save_img = true;
-      save_ir_img = true;
+      g_save_img = true;
+      g_save_ir_img = true;
     } else if (keypressed != -1) {
-      if (!process_gain_control(keypressed)) {
-        LOG(ERROR) << "cannot process gain control";
-      }
-      if (!process_ir_control(keypressed)) {
-        LOG(ERROR) << "cannot process infrared control";
+      g_xp_sensor_ptr->set_key_control(keypressed);
+      if (g_xp_sensor_ptr->get_ir_on_status()) {
+        cv::namedWindow("img_lr_IR");
+        cv::moveWindow("img_lr_IR", 10, 10);
+        if (FLAGS_depth || FLAGS_ir_depth) {
+          cv::namedWindow("depth_canvas");
+          cv::moveWindow("depth_canvas", 1, 1);
+        }
+      } else {
+        cv::destroyWindow("img_lr_IR");
+        if (FLAGS_depth || FLAGS_ir_depth) {
+          cv::destroyWindow("depth_canvas");
+        }
       }
     }
     // TODO(huyuexiang): if there is no usleep(1000),
